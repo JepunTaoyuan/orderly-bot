@@ -1,7 +1,0 @@
-{
-  "addedSpawnableAgents": [
-    "codebuff/base@0.0.14",
-    "codebuff/reviewer@0.0.8",
-    "codebuff/deep-thinker@0.0.3"
-  ]
-}

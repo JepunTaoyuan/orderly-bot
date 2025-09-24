@@ -1,1 +1,0 @@
-這是一個orderly上的grid trading demo server，只需要做最簡最簡的MVP。
