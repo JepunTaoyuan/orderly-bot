@@ -6,32 +6,38 @@ An enterprise-grade grid trading system with comprehensive monitoring, validatio
 
 ```
 orderly_bot/
-├── main.py                 # Main entry point
+├── app.py                 # Main entry point
 ├── src/
 │   ├── api/               # FastAPI server and endpoints
-│   │   └── main.py       # API routes and server setup
-│   ├── core/             # Core trading logic
-│   │   ├── grid_bot.py   # Main trading bot implementation
+│   │   └── server.py      # API routes and server setup
+│   ├── core/              # Core trading logic
+│   │   ├── grid_bot.py    # Main trading bot implementation
 │   │   ├── grid_signal.py # Signal generation and strategy
-│   │   └── client.py     # Exchange API client
-│   └── utils/            # Utilities and infrastructure
+│   │   └── client.py      # Exchange API client
+│   └── utils/             # Utilities and infrastructure
 │       ├── session_manager.py    # Multi-session management
 │       ├── event_queue.py        # Sequential event processing
 │       ├── market_validator.py   # Price/size validation
 │       ├── retry_handler.py      # Resilient API calls
 │       ├── order_tracker.py      # Fill tracking
-│       └── logging_config.py     # Structured logging
-├── docs/                  # Documentation
-├── tests/                 # Test files (when added)
-├── .agents/              # Codebuff agent configurations
-└── codebuff.json         # Codebuff configuration
+│       ├── logging_config.py     # Structured logging
+│       └── settings.py           # Environment-based settings
+├── tests/                 # Test files
+├── .env.example           # Environment variables template
+└── README.md
 ```
 
 ## 🚀 Quick Start
 
 ```bash
-# Start the server
-python main.py
+# Copy environment template and fill in values
+cp .env.example .env
+
+# Start the server (recommended)
+uvicorn src.api.server:app --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8000}
+
+# Or use the Python entrypoint
+python app.py
 
 # Check health
 curl http://localhost:8000/health

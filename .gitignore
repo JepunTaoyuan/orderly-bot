@@ -1,4 +1,41 @@
 .trae
-__pycache__
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.envrc
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build outputs
+build/
+dist/
+.cache/
+.mypy_cache/
+ruff_cache/
+
+# Editors/OS
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Project files
 codebuff.json
-.agent
+.agents
+
+# Additional Python cache directories
+**/__pycache__/
+*.egg-info/

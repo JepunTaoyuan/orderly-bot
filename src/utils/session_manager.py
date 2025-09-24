@@ -42,7 +42,8 @@ class SessionManager:
                 return True
             except Exception as e:
                 logger.error(f"創建會話 {session_id} 失敗: {e}")
-                return False
+                # 重要：不要吞掉例外，讓上層決定回應碼（例如 500）
+                raise
     
     async def stop_session(self, session_id: str) -> bool:
         """
@@ -66,8 +67,9 @@ class SessionManager:
                 logger.info(f"會話 {session_id} 已停止")
                 return True
             except Exception as e:
-                logger.error(f"停止會話 {session_id} 失敗: {e}")
-                return False
+                logger.error(f"創建會話 {session_id} 失敗: {e}")
+                # 重要：不要吞掉例外，讓上層決定回應碼（例如 500）
+                raise
     
     async def get_session_status(self, session_id: str) -> Optional[Dict[str, Any]]:
         """

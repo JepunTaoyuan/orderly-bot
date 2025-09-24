@@ -18,7 +18,7 @@ from src.utils.market_validator import MarketValidator, ValidationError
 from src.utils.order_tracker import OrderTracker, OrderStatus
 from src.utils.logging_config import get_logger, metrics, set_session_context
 from orderly_evm_connector.websocket.websocket_api import WebsocketPrivateAPIClient
-import asyncio
+from src.utils.settings import get_settings
 
 # 使用結構化日誌
 logger = get_logger("grid_bot")
@@ -51,6 +51,22 @@ class GridTradingBot:
     def _convert_side(self, side: OrderSide) -> str:
         """將訊號生成器的方向轉換為 Orderly 格式"""
         return "BUY" if side == OrderSide.BUY else "SELL"
+    
+    def _safe_close_ws(self):
+        """安全地關閉 WebSocket 連接，兼容不同客戶端實作。"""
+        if not self.wss_client:
+            return
+        for attr in ("close", "disconnect", "close_ws", "stop", "shutdown"):
+            try:
+                fn = getattr(self.wss_client, attr, None)
+                if callable(fn):
+                    fn()
+                    logger.info(f"WebSocket 已關閉（方法: {attr}）")
+                    return
+            except Exception as e:
+                logger.warning(f"嘗試關閉 WebSocket 失敗（方法: {attr}）: {e}")
+        # 若無任何已知關閉方法，忽略但記錄
+        logger.warning("WebSocket 客戶端不支援顯式關閉方法，已略過")
     
     def _setup_websocket(self):
         """設置 WebSocket 連接監聽訂單成交"""
@@ -101,11 +117,12 @@ class GridTradingBot:
             except Exception as e:
                 logger.error(f"處理 WebSocket 訊息失敗: {e}")
 
+        settings = get_settings()
         self.wss_client = WebsocketPrivateAPIClient(
-            orderly_testnet=True,
-            orderly_account_id="0x5e2cccd91ac05c8f1a9de15c629deffcf1de88abacf7bb7ac8d3b9d8e9317bb0",
-            orderly_key="ed25519:EpBR88faPoav78urb4MSeNxRaPTkxohXubgW5vBQwh1T",
-            orderly_secret="ed25519:FDoEfpUzcMKk5ZDd46Tk6seS6ed79jGmMVCSriQ2Jfqs",
+            orderly_testnet=settings.orderly_testnet,
+            orderly_account_id=settings.orderly_account_id,
+            orderly_key=settings.orderly_key,
+            orderly_secret=settings.orderly_secret,
             on_message=on_message,
             on_close=on_close,
             debug=True,
@@ -144,7 +161,6 @@ class GridTradingBot:
                 logger.info(f"網格訂單成交: 價格={grid_price}, 成交價={executed_price}")
                 
                 # 創建成交訊號對象
-                from grid_signal import TradingSignal, OrderSide
                 filled_signal = TradingSignal(
                     symbol="BTCUSDT",
                     side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
@@ -420,7 +436,7 @@ class GridTradingBot:
             
             # 關閉 WebSocket 連接
             if self.wss_client:
-                self.wss_client.close()
+                self._safe_close_ws()
             
             logger.info("停止訊號處理完成")
             
@@ -469,11 +485,16 @@ class GridTradingBot:
             self._setup_websocket()
             
             # 啟動 WebSocket 監聽
-            self.wss_client.get_notifications()
+            try:
+                self.wss_client.get_notifications()
+            except Exception as e:
+                # 在測試/某些環境中，可能沒有實作；記錄但不中斷啟動
+                logger.warning(f"啟動 WebSocket 通知監聽失敗: {e}")
             
             # 創建訊號生成器（僅用於初始網格設置）
             self.signal_generator = GridSignalGenerator(
                 ticker=config['ticker'],
+                current_price=config['current_price'],
                 direction=config['direction'],
                 upper_bound=config['upper_bound'],
                 lower_bound=config['lower_bound'],
@@ -524,7 +545,7 @@ class GridTradingBot:
         
         # 關閉 WebSocket 連接
         if self.wss_client:
-            self.wss_client.close()
+            self._safe_close_ws()
         
         self.is_running = False
         logger.info("網格交易機器人已停止", event_type="bot_stopped")

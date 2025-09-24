@@ -12,6 +12,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional, Callable
 from enum import Enum
 from dataclasses import dataclass
+from src.utils.logging_config import get_logger
 
 class Direction(Enum):
     LONG = "做多"
@@ -36,6 +37,8 @@ class TradingSignal:
         if self.timestamp is None:
             import time
             self.timestamp = time.time()
+
+logger = get_logger("grid_signal")
 
 class GridSignalGenerator:
     def __init__(self, ticker: str, current_price: float, direction: Direction, upper_bound: float, 
@@ -78,18 +81,18 @@ class GridSignalGenerator:
         
         # 修正網格間距計算，確保不重複 current_price
         if self.grid_levels_above > 0:
-            self.price_above = (upper_bound - current_price) / self.grid_levels_above
+            self.price_above = (self.upper_bound - self.current_price) / self.grid_levels_above
         else:
-            self.price_above = 0
+            self.price_above = Decimal('0')
             
         if self.grid_levels_below > 0:
-            self.price_below = (current_price - lower_bound) / self.grid_levels_below
+            self.price_below = (self.current_price - self.lower_bound) / self.grid_levels_below
         else:
-            self.price_below = 0
+            self.price_below = Decimal('0')
             
         self.grid_prices = self._calculate_grid_prices()
         self.current_pointer = 0  # 初始設為0，第一次成交後設為該價格的index
-        self.amount_per_grid = total_amount / grid_levels
+        self.amount_per_grid = self.total_amount / Decimal(str(grid_levels))
         
         # 找到最接近 current_price 的網格 index（用於參考）
         self.center_index = self._find_closest_price_index(self.current_price)
@@ -151,7 +154,17 @@ class GridSignalGenerator:
             signal_type=signal_type
         )
         
-        print(f"生成訊號: {self.ticker} {side.value} 價格:{price} 數量:{size} 類型:{signal_type}")
+        logger.info(
+            "生成訊號",
+            event_type="signal_emit",
+            data={
+                "ticker": self.ticker,
+                "side": side.value,
+                "price": str(price),
+                "size": str(size),
+                "type": signal_type,
+            },
+        )
         
         # 如果有回調函數，則調用（支援 async 回調）
         if self.signal_callback:
@@ -177,11 +190,10 @@ class GridSignalGenerator:
             reason: 停止原因
         """
         if not self.is_active:
-            print("網格已經停止，無需重複操作")
+            logger.info("網格已經停止，無需重複操作")
             return
             
-        print(f"\n=== 停止網格交易訊號生成 ===")
-        print(f"停止原因: {reason}")
+        logger.info("停止網格交易訊號生成", event_type="grid_stop", data={"reason": reason})
         
         # 生成停止訊號
         stop_signal = TradingSignal(
@@ -207,7 +219,7 @@ class GridSignalGenerator:
         self.is_active = False
         self.stop_reason = reason
         
-        print("網格訊號生成已停止")
+        logger.info("網格訊號生成已停止", event_type="grid_stopped")
     
     def stop_by_signal(self):
         """
@@ -243,25 +255,31 @@ class GridSignalGenerator:
     
     def setup_initial_grid(self):
         """設置初始網格訊號 - 只掛 current_price 上下的單"""
-        print(f"\n=== 設置 {self.ticker} 網格交易訊號 ===")
-        print(f"方向: {self.direction.value}")
-        print(f"價格區間: {self.lower_bound} - {self.upper_bound}")
-        print(f"網格數量: {self.grid_levels}")
-        print(f"總投入: {self.total_amount} USDT")
+        logger.info(
+            "設置網格交易訊號",
+            event_type="grid_setup",
+            data={
+                "ticker": self.ticker,
+                "direction": self.direction.value,
+                "range": f"{self.lower_bound}-{self.upper_bound}",
+                "grid_levels": self.grid_levels,
+                "total_amount": str(self.total_amount),
+            },
+        )
         print(f"每格投入: {self.amount_per_grid:.2f} USDT")
         print(f"當前價格: {self.current_price}")
         print(f"中心網格 index: {self.center_index}")
         
         # 顯示停損價格
         if self.stop_bot_price:
-            print(f"下界停損: {self.stop_bot_price}")
+            logger.info("設置下界停損", event_type="grid_stop_loss", data={"lower": str(self.stop_bot_price)})
         if self.stop_top_price:
-            print(f"上界停損: {self.stop_top_price}")
+            logger.info("設置上界停損", event_type="grid_stop_loss", data={"upper": str(self.stop_top_price)})
         
         print()
         
         if not self.is_active:
-            print("網格未激活，跳過設置")
+            logger.info("網格未激活，跳過設置")
             return
         
         # 根據網格類型只掛 current_price 上下的單
@@ -272,7 +290,7 @@ class GridSignalGenerator:
                 if price < self.current_price:  # 只掛低於當前價格的買單
                     position_size = self._calculate_position_size(price)
                     signal = self._emit_signal(OrderSide.BUY, price, position_size, "INITIAL")
-                    print(f"掛買單: 價格 {price}, 數量 {position_size}")
+                    logger.info("掛買單", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
                     
         elif self.direction == Direction.SHORT:
             # 做空策略：只掛 current_price 上方的賣單
@@ -281,7 +299,7 @@ class GridSignalGenerator:
                 if price > self.current_price:  # 只掛高於當前價格的賣單
                     position_size = self._calculate_position_size(price)
                     signal = self._emit_signal(OrderSide.SELL, price, position_size, "INITIAL")
-                    print(f"掛賣單: 價格 {price}, 數量 {position_size}")
+                    logger.info("掛賣單", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
                     
         elif self.direction == Direction.BOTH:
             # 雙向策略：掛 current_price 上下各一格的買賣單
@@ -292,16 +310,16 @@ class GridSignalGenerator:
                 buy_price = self.grid_prices[center_idx - 1]
                 buy_size = self._calculate_position_size(buy_price)
                 buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "INITIAL")
-                print(f"掛買單: 價格 {buy_price}, 數量 {buy_size}")
+                logger.info("掛買單", event_type="grid_order_initial", data={"price": str(buy_price), "size": str(buy_size)})
             
             # 掛上方一格的賣單
             if center_idx < len(self.grid_prices) - 1:
                 sell_price = self.grid_prices[center_idx + 1]
                 sell_size = self._calculate_position_size(sell_price)
                 sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "INITIAL")
-                print(f"掛賣單: 價格 {sell_price}, 數量 {sell_size}")
+                logger.info("掛賣單", event_type="grid_order_initial", data={"price": str(sell_price), "size": str(sell_size)})
         
-        print("初始網格設置完成")
+        logger.info("初始網格設置完成", event_type="grid_setup_done")
     
     
     def on_order_filled(self, filled_signal: TradingSignal):
@@ -312,7 +330,7 @@ class GridSignalGenerator:
         Args:
             filled_signal: 已成交的訊號
         """
-        print(f"訂單成交: {filled_signal.side.value} {filled_signal.size} @ {filled_signal.price}")
+        logger.info("訂單成交", event_type="order_filled", data={"side": filled_signal.side.value, "size": str(filled_signal.size), "price": str(filled_signal.price)})
         
         # 找到成交價格對應的網格 index
         filled_index = self._find_closest_price_index(filled_signal.price)
@@ -321,14 +339,14 @@ class GridSignalGenerator:
         if not self.first_trigger:
             self.current_pointer = filled_index
             self.first_trigger = True
-            print(f"第一次觸發網格，設置 current_pointer = {self.current_pointer}")
+            logger.info("第一次觸發網格", event_type="grid_first_trigger", data={"current_pointer": self.current_pointer})
         else:
             # 更新 current_pointer 到成交的格子
             self.current_pointer = filled_index
-            print(f"更新 current_pointer = {self.current_pointer}")
+            logger.info("更新 current_pointer", event_type="grid_pointer_update", data={"current_pointer": self.current_pointer})
         
         # 取消所有掛單（這裡只是發出取消訊號，實際取消由交易系統處理）
-        print("發出取消所有掛單的訊號")
+        logger.info("發出取消所有掛單的訊號", event_type="grid_cancel_all")
         cancel_signal = TradingSignal(
             symbol=self.ticker,
             side=OrderSide.BUY,  # 取消訊號的方向不重要
@@ -354,12 +372,12 @@ class GridSignalGenerator:
     def _generate_counter_signal(self, filled_signal: TradingSignal):
         """根據 current_pointer 掛相鄰格子的單"""
         if not self.is_active:
-            print("網格已停止，不生成新訊號")
+            logger.info("網格已停止，不生成新訊號")
             return
         
         try:
             current_idx = self.current_pointer
-            print(f"根據 current_pointer={current_idx} 生成相鄰格子的掛單")
+            logger.info("生成相鄰格子的掛單", event_type="grid_counter_setup", data={"current_pointer": current_idx})
             
             if self.direction == Direction.LONG:
                 # 做多策略：掛下方的買單
@@ -368,9 +386,9 @@ class GridSignalGenerator:
                     buy_price = self.grid_prices[buy_idx]
                     buy_size = self._calculate_position_size(buy_price)
                     buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "COUNTER")
-                    print(f"掛買單: index={buy_idx}, 價格={buy_price}, 數量={buy_size}")
+                    logger.info("掛買單", event_type="grid_order_counter", data={"index": buy_idx, "price": str(buy_price), "size": str(buy_size)})
                 else:
-                    print("已到達網格下界，無法掛買單")
+                    logger.warning("已到達網格下界，無法掛買單")
                     
             elif self.direction == Direction.SHORT:
                 # 做空策略：掛上方的賣單
@@ -379,9 +397,9 @@ class GridSignalGenerator:
                     sell_price = self.grid_prices[sell_idx]
                     sell_size = self._calculate_position_size(sell_price)
                     sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "COUNTER")
-                    print(f"掛賣單: index={sell_idx}, 價格={sell_price}, 數量={sell_size}")
+                    logger.info("掛賣單", event_type="grid_order_counter", data={"index": sell_idx, "price": str(sell_price), "size": str(sell_size)})
                 else:
-                    print("已到達網格上界，無法掛賣單")
+                    logger.warning("已到達網格上界，無法掛賣單")
                     
             elif self.direction == Direction.BOTH:
                 # 雙向策略：掛上下相鄰格子的單
@@ -392,9 +410,9 @@ class GridSignalGenerator:
                     buy_price = self.grid_prices[buy_idx]
                     buy_size = self._calculate_position_size(buy_price)
                     buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "COUNTER")
-                    print(f"掛買單: index={buy_idx}, 價格={buy_price}, 數量={buy_size}")
+                    logger.info("掛買單", event_type="grid_order_counter", data={"index": buy_idx, "price": str(buy_price), "size": str(buy_size)})
                 else:
-                    print("已到達網格下界，無法掛買單")
+                    logger.warning("已到達網格下界，無法掛買單")
                 
                 # 掛上方的賣單
                 if current_idx < len(self.grid_prices) - 1:
@@ -402,38 +420,37 @@ class GridSignalGenerator:
                     sell_price = self.grid_prices[sell_idx]
                     sell_size = self._calculate_position_size(sell_price)
                     sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "COUNTER")
-                    print(f"掛賣單: index={sell_idx}, 價格={sell_price}, 數量={sell_size}")
+                    logger.info("掛賣單", event_type="grid_order_counter", data={"index": sell_idx, "price": str(sell_price), "size": str(sell_size)})
                 else:
-                    print("已到達網格上界，無法掛賣單")
+                    logger.warning("已到達網格上界，無法掛賣單")
                     
         except Exception as e:
-            print(f"生成相鄰格子掛單失敗: {e}")
+            logger.error(f"生成相鄰格子掛單失敗: {e}")
     
     def get_status(self):
         """獲取當前網格狀態"""
-        print(f"\n=== 網格狀態 ===")
-        print(f"網格激活狀態: {'運行中' if self.is_active else '已停止'}")
-        if not self.is_active and self.stop_reason:
-            print(f"停止原因: {self.stop_reason}")
-        print(f"第一次觸發: {'是' if self.first_trigger else '否'}")
-        print(f"當前指針位置: {self.current_pointer}")
-        print(f"網格價格: {self.grid_prices}")
-        print(f"中心網格 index: {self.center_index}")
-        
-        if self.stop_bot_price or self.stop_top_price:
-            print("停損設置:")
-            if self.stop_bot_price:
-                print(f"  下界停損: {self.stop_bot_price}")
-            if self.stop_top_price:
-                print(f"  上界停損: {self.stop_top_price}")
+        logger.info(
+            "網格狀態",
+            event_type="grid_status",
+            data={
+                "active": self.is_active,
+                "stop_reason": self.stop_reason,
+                "first_trigger": self.first_trigger,
+                "current_pointer": self.current_pointer,
+                "grid_prices": [str(p) for p in self.grid_prices],
+                "center_index": self.center_index,
+                "stop_bot_price": str(self.stop_bot_price) if self.stop_bot_price else None,
+                "stop_top_price": str(self.stop_top_price) if self.stop_top_price else None,
+            },
+        )
     
     def restart_grid(self):
         """重新啟動網格交易訊號生成"""
         if self.is_active:
-            print("網格正在運行中")
+            logger.info("網格正在運行中")
             return
             
-        print("\n=== 重新啟動網格交易訊號生成 ===")
+        logger.info("重新啟動網格交易訊號生成", event_type="grid_restart")
         self.is_active = True
         self.stop_reason = None
         

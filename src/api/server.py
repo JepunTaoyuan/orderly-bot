@@ -14,12 +14,17 @@ import asyncio
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ConfigDict
+from pydantic import model_validator
 
 from src.core.grid_signal import Direction
 from src.utils.session_manager import SessionManager
 from src.utils.logging_config import configure_logging, get_logger, metrics, set_session_context
+from src.utils.error_codes import GridTradingException, ErrorCode
+from src.utils.market_validator import ValidationError
+from src.utils.api_helpers import SessionContextManager, validate_session_id, create_session_id
 
 
 # 配置日誌
@@ -31,11 +36,54 @@ app = FastAPI(title="Grid Trading Server (MVP)")
 # 全域會話管理器
 session_manager = SessionManager()
 
+# 全域異常處理器
+@app.exception_handler(GridTradingException)
+async def grid_trading_exception_handler(request: Request, exc: GridTradingException):
+    """處理網格交易自定義異常"""
+    logger.error("網格交易異常", event_type="grid_trading_error", data={
+        "error_code": exc.error_code.value,
+        "message": exc.error_detail.message,
+        "details": exc.details,
+        "path": request.url.path
+    })
+    
+    return JSONResponse(
+        status_code=exc.get_http_status(),
+        content=exc.to_dict()
+    )
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: ValidationError):
+    """處理驗證錯誤"""
+    logger.error("驗證錯誤", event_type="validation_error", data={
+        "message": str(exc),
+        "path": request.url.path
+    })
+    
+    grid_exc = GridTradingException(
+        error_code=ErrorCode.INVALID_GRID_CONFIG,
+        details={"validation_error": str(exc)}
+    )
+    
+    return JSONResponse(
+        status_code=grid_exc.get_http_status(),
+        content=grid_exc.to_dict()
+    )
+
 class RegisterConfig(BaseModel):
-    user_id: str = Field(..., example="user123")
-    user_api_key: str = Field(..., example="user123")
-    user_api_secret: str = Field(..., example="user123")
-    user_wallet_address: str = Field(..., example="user123")
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "user_id": "user123",
+            "user_api_key": "user123",
+            "user_api_secret": "user123",
+            "user_wallet_address": "user123"
+        }
+    })
+    
+    user_id: str
+    user_api_key: str
+    user_api_secret: str
+    user_wallet_address: str
 
 @app.post("/api/enable")
 async def enable_bot_trading(config: RegisterConfig):
@@ -43,17 +91,49 @@ async def enable_bot_trading(config: RegisterConfig):
     pass
 
 class StartConfig(BaseModel):
-    ticker: str = Field(..., example="BTCUSDT")
-    direction: str = Field(..., pattern="^(LONG|SHORT|BOTH)$", example="BOTH")
-    current_price: float = Field(..., example=42500)
-    upper_bound: float = Field(..., example=45000)
-    lower_bound: float = Field(..., example=40000)
-    grid_levels: int = Field(..., ge=2, example=6)
-    total_amount: float = Field(..., gt=0, example=100)
-    stop_bot_price: Optional[float] = Field(None, example=38000)
-    stop_top_price: Optional[float] = Field(None, example=47000)
-    user_id: str = Field(..., example="user123")
-    user_sig: str = Field(..., example="user123sig")
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "ticker": "BTCUSDT",
+            "direction": "BOTH",
+            "current_price": 42500,
+            "upper_bound": 45000,
+            "lower_bound": 40000,
+            "grid_levels": 6,
+            "total_amount": 100,
+            "stop_bot_price": 38000,
+            "stop_top_price": 47000,
+            "user_id": "user123",
+            "user_sig": "user123sig"
+        }
+    })
+    
+    ticker: str = Field(..., pattern=r"^[A-Z]+USDT$")
+    direction: str = Field(..., pattern="^(LONG|SHORT|BOTH)$")
+    current_price: float = Field(..., gt=0)
+    upper_bound: float = Field(..., gt=0)
+    lower_bound: float = Field(..., gt=0)
+    grid_levels: int = Field(..., ge=2)
+    total_amount: float = Field(..., gt=0)
+    stop_bot_price: Optional[float] = Field(None, gt=0)
+    stop_top_price: Optional[float] = Field(None, gt=0)
+    user_id: str = Field(..., min_length=1)
+    user_sig: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_bounds(self):
+        # 價格邏輯驗證
+        if self.lower_bound >= self.upper_bound:
+            raise ValueError("lower_bound must be less than upper_bound")
+        if not (self.lower_bound <= self.current_price <= self.upper_bound):
+            raise ValueError("當前價格必須在上下界範圍內")
+        
+        # 停損價格驗證
+        if self.stop_bot_price and self.stop_bot_price >= self.lower_bound:
+            raise ValueError("stop_bot_price must be less than lower_bound")
+        if self.stop_top_price and self.stop_top_price <= self.upper_bound:
+            raise ValueError("stop_top_price must be greater than upper_bound")
+            
+        return self
 
     def to_internal(self) -> dict:
         # 轉 Direction 枚舉
@@ -80,67 +160,99 @@ class StartConfig(BaseModel):
 
 @app.post("/api/grid/start")
 async def start_grid(config: StartConfig):
-    session_id = f"{config.user_id}_{config.ticker}"
-    set_session_context(session_id)
+    session_id = create_session_id(config.user_id, config.ticker)
     
-    try:
-        logger.info("啟動網格交易請求", event_type="grid_start", data={
-            "session_id": session_id,
-            "ticker": config.ticker,
-            "direction": config.direction
-        })
-        
-        metrics.increment_counter("api.grid.start.requests", tags={"ticker": config.ticker})
-        
-        success = await session_manager.create_session(session_id, config.to_internal())
-        
-        if success:
-            metrics.increment_counter("api.grid.start.success", tags={"ticker": config.ticker})
-            logger.info("網格交易啟動成功", event_type="grid_started", data={"session_id": session_id})
-            return {"status": "started", "session_id": session_id}
-        else:
-            metrics.increment_counter("api.grid.start.already_running", tags={"ticker": config.ticker})
-            logger.warning("網格交易已在運行", event_type="grid_already_running", data={"session_id": session_id})
-            return {"status": "already_running", "session_id": session_id}
+    with SessionContextManager(session_id):
+        try:
+            logger.info("啟動網格交易請求", event_type="grid_start", data={
+                "session_id": session_id,
+                "ticker": config.ticker,
+                "direction": config.direction
+            })
             
-    except Exception as e:
-        metrics.increment_counter("api.grid.start.errors", tags={"ticker": config.ticker})
-        logger.error("啟動網格交易失敗", event_type="grid_start_error", data={
-            "session_id": session_id,
-            "error": str(e)
-        })
-        raise HTTPException(status_code=500, detail=f"failed_to_start: {e}")
+            metrics.increment_counter("api.grid.start.requests", tags={"ticker": config.ticker})
+            
+            success = await session_manager.create_session(session_id, config.to_internal())
+            
+            if success:
+                metrics.increment_counter("api.grid.start.success", tags={"ticker": config.ticker})
+                logger.info("網格交易啟動成功", event_type="grid_started", data={"session_id": session_id})
+                return {"status": "started", "session_id": session_id}
+            else:
+                # 會話已存在的情況
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_ALREADY_EXISTS,
+                    details={"session_id": session_id}
+                )
+                
+        except GridTradingException:
+            # 重新拋出自定義異常，讓全域處理器處理
+            raise
+        except ValidationError as e:
+            # 轉換驗證錯誤為自定義異常
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_GRID_CONFIG,
+                details={"validation_error": str(e)},
+                original_error=e
+            )
+        except Exception as e:
+            metrics.increment_counter("api.grid.start.errors", tags={"ticker": config.ticker})
+            logger.error("啟動網格交易失敗", event_type="grid_start_error", data={
+                "session_id": session_id,
+                "error": str(e)
+            })
+            raise GridTradingException(
+                error_code=ErrorCode.SESSION_CREATE_FAILED,
+                details={"session_id": session_id},
+                original_error=e
+            )
 
 
 class StopConfig(BaseModel):
-    session_id: str = Field(..., example="user123_BTCUSDT")
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "session_id": "user123_BTCUSDT"
+        }
+    })
+    
+    session_id: str = Field(..., min_length=1)
 
 @app.post("/api/grid/stop")
 async def stop_grid(config: StopConfig):
-    set_session_context(config.session_id)
+    session_id = validate_session_id(config.session_id)
     
-    try:
-        logger.info("停止網格交易請求", event_type="grid_stop", data={"session_id": config.session_id})
-        metrics.increment_counter("api.grid.stop.requests")
-        
-        success = await session_manager.stop_session(config.session_id)
-        
-        if success:
-            metrics.increment_counter("api.grid.stop.success")
-            logger.info("網格交易停止成功", event_type="grid_stopped", data={"session_id": config.session_id})
-            return {"status": "stopped", "session_id": config.session_id}
-        else:
-            metrics.increment_counter("api.grid.stop.not_found")
-            logger.warning("網格交易會話不存在", event_type="grid_not_found", data={"session_id": config.session_id})
-            return {"status": "not_found", "session_id": config.session_id}
+    with SessionContextManager(session_id):
+        try:
+            logger.info("停止網格交易請求", event_type="grid_stop", data={"session_id": session_id})
+            metrics.increment_counter("api.grid.stop.requests")
             
-    except Exception as e:
-        metrics.increment_counter("api.grid.stop.errors")
-        logger.error("停止網格交易失敗", event_type="grid_stop_error", data={
-            "session_id": config.session_id,
-            "error": str(e)
-        })
-        raise HTTPException(status_code=500, detail=f"failed_to_stop: {e}")
+            success = await session_manager.stop_session(session_id)
+            
+            if success:
+                metrics.increment_counter("api.grid.stop.success")
+                logger.info("網格交易停止成功", event_type="grid_stopped", data={"session_id": session_id})
+                return {"status": "stopped", "session_id": session_id}
+            else:
+                # 會話不存在的情況
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_NOT_FOUND,
+                    details={"session_id": session_id}
+                )
+                
+        except GridTradingException:
+            # 重新拋出自定義異常，讓全域處理器處理
+            raise
+        except Exception as e:
+            metrics.increment_counter("api.grid.stop.errors")
+            logger.error("停止網格交易失敗", event_type="grid_stop_error", data={
+                "session_id": session_id,
+                "error": str(e)
+            })
+            raise GridTradingException(
+                error_code=ErrorCode.SESSION_STOP_FAILED,
+                details={"session_id": session_id},
+                original_error=e
+            )
 
 
 @app.get("/api/grid/status/{session_id}")
@@ -148,9 +260,27 @@ async def get_status(session_id: str):
     try:
         status = await session_manager.get_session_status(session_id)
         if status is not None:
-            return {"session_id": session_id, "status": status}
+            return status
         else:
-            raise HTTPException(status_code=404, detail="session_not_found")
+            raise GridTradingException(
+                error_code=ErrorCode.SESSION_NOT_FOUND,
+                details={"session_id": session_id}
+            )
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("獲取會話狀態失敗", event_type="get_status_error", data={
+            "session_id": session_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"session_id": session_id},
+            original_error=e
+        )
+    except HTTPException:
+        # 直接傳遞既有的 HTTP 錯誤（例如 404）
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed_to_get_status: {e}")
 
@@ -160,7 +290,11 @@ async def list_sessions():
         sessions = await session_manager.list_sessions()
         return {"sessions": sessions}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"failed_to_list_sessions: {e}")
+        logger.error("列出會話失敗", event_type="list_sessions_error", data={"error": str(e)})
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            original_error=e
+        )
 
 @app.get("/health")
 async def health_check():
@@ -185,13 +319,32 @@ async def readiness_check():
         }
     except Exception as e:
         logger.error("就緒檢查失敗", event_type="health_check", data={"error": str(e)})
-        raise HTTPException(status_code=503, detail="Service not ready")
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"check_type": "readiness"},
+            original_error=e
+        )
 
 @app.get("/metrics")
-async def get_metrics():
-    """獲取系統指標"""
+async def get_metrics(limit_counters: int = 10, limit_gauges: int = 5, limit_histograms: int = 3):
+    """獲取系統指標（可限制每類返回數量，預設 counters:10, gauges:5, histograms:3）"""
     try:
-        return metrics.get_metrics()
+        data = metrics.get_metrics()
+
+        def _limit_dict(d: dict, n: int) -> dict:
+            try:
+                if n is None or n <= 0 or len(d) <= n:
+                    return d
+                # 保留最近加入的 n 個鍵（Python 3.7+ dict 保序）
+                items = list(d.items())[-n:]
+                return {k: v for k, v in items}
+            except Exception:
+                return d
+
+        data["counters"] = _limit_dict(data.get("counters", {}), limit_counters)
+        data["gauges"] = _limit_dict(data.get("gauges", {}), limit_gauges)
+        data["histograms"] = _limit_dict(data.get("histograms", {}), limit_histograms)
+        return data
     except Exception as e:
         logger.error("獲取指標失敗", event_type="metrics", data={"error": str(e)})
         raise HTTPException(status_code=500, detail=f"failed_to_get_metrics: {e}")
