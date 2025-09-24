@@ -38,6 +38,10 @@ class GridTradingBot:
         self.market_info = None  # 當前市場信息
         self.order_tracker = OrderTracker()  # 訂單追踪器
         
+        # WebSocket 事件去重
+        self.processed_fills = set()  # 記錄已處理的成交ID
+        self.processed_fills_max_size = 1000  # 限制集合大小，防止記憶體洩漏
+        
     def _convert_symbol(self, symbol: str) -> str:
         """
         將訊號生成器的符號轉換為 Orderly 格式
@@ -130,14 +134,51 @@ class GridTradingBot:
     
     async def _handle_order_filled_event(self, fill_data: Dict[str, Any]):
         """
-        通過事件隊列處理訂單成交
-        """
-        order_id = fill_data["order_id"]
-        executed_price = fill_data["executed_price"]
-        executed_quantity = fill_data["executed_quantity"]
-        side = fill_data["side"]
+        處理 WebSocket 成交事件（帶去重機制）
         
-        await self._handle_order_filled(order_id, executed_price, executed_quantity, side)
+        Args:
+            fill_data: 成交數據
+        """
+        try:
+            # 提取成交信息
+            order_id = fill_data.get('order_id')
+            executed_price = fill_data.get('executed_price')
+            executed_quantity = fill_data.get('executed_quantity')
+            side = fill_data.get('side')
+            fill_id = fill_data.get('fill_id')  # 成交唯一ID
+            
+            # 檢查必要字段
+            if not all([order_id, executed_price, executed_quantity, side]):
+                logger.warning(f"成交事件缺少必要字段: {fill_data}")
+                return
+            
+            # WebSocket 事件去重檢查
+            if fill_id:
+                if fill_id in self.processed_fills:
+                    logger.debug(f"重複成交事件，跳過: fill_id={fill_id}")
+                    return
+                
+                # 添加到已處理集合
+                self.processed_fills.add(fill_id)
+                
+                # 限制集合大小，防止記憶體洩漏
+                if len(self.processed_fills) > self.processed_fills_max_size:
+                    # 移除最舊的一半記錄
+                    old_fills = list(self.processed_fills)[:self.processed_fills_max_size // 2]
+                    for old_fill in old_fills:
+                        self.processed_fills.discard(old_fill)
+                    logger.debug(f"清理舊的成交記錄，保留 {len(self.processed_fills)} 個")
+            
+            # 處理成交事件
+            await self._handle_order_filled(
+                order_id=int(order_id),
+                executed_price=float(executed_price),
+                executed_quantity=float(executed_quantity),
+                side=side
+            )
+            
+        except Exception as e:
+            logger.error(f"處理成交事件失敗: {e}, 數據: {fill_data}")
     
     async def _handle_order_filled(self, order_id: int, executed_price: float, executed_quantity: float, side: str):
         """
@@ -200,13 +241,27 @@ class GridTradingBot:
     
     async def _create_grid_order(self, price: float, side: str):
         """
-        創建網格訂單
+        創建網格訂單（帶重複檢查和事務性處理）
         
         Args:
             price: 訂單價格
             side: 交易方向
         """
         try:
+            # 檢查重複掛單
+            async with self._orders_lock:
+                if price in self.grid_orders:
+                    existing_order_id = self.grid_orders[price]
+                    if existing_order_id != "PENDING":
+                        logger.warning(f"價格 {price} 已有掛單 {existing_order_id}，跳過重複掛單")
+                        return
+                    else:
+                        logger.warning(f"價格 {price} 正在處理中，跳過")
+                        return
+                
+                # 標記為處理中，防止併發重複
+                self.grid_orders[price] = "PENDING"
+            
             # 計算訂單數量
             quantity = self.signal_generator.total_amount / self.signal_generator.grid_levels / price
             
@@ -214,49 +269,64 @@ class GridTradingBot:
             if self.market_info:
                 try:
                     norm_price, norm_quantity = self.validator.validate_order(
-                        self.market_info.symbol, price, quantity
+                        self.market_info.symbol, Decimal(str(price)), Decimal(str(quantity))
                     )
-                    price, quantity = norm_price, norm_quantity
+                    price, quantity = float(norm_price), float(norm_quantity)
                 except ValidationError as e:
                     logger.error(f"訂單驗證失敗: {e}")
+                    # 清理 PENDING 標記
+                    async with self._orders_lock:
+                        self.grid_orders.pop(price, None)
                     return
             
             # 創建限價訂單
+            symbol = self.market_info.symbol if self.market_info else "PERP_BTC_USDC"
             response = await self.client.create_limit_order(
-                symbol=self.market_info.symbol if self.market_info else "PERP_BTC_USDC",
+                symbol=symbol,
                 side=side,
-                price=float(price),
-                quantity=float(quantity)
+                price=price,
+                quantity=quantity
             )
             await asyncio.sleep(0.1)
             
-            # 記錄訂單
-            if response.get('success', True):
-                order_id = response.get('data', {}).get('order_id')
-                if order_id:
-                    async with self._orders_lock:
+            # 事務性更新狀態
+            async with self._orders_lock:
+                if response.get('success', True):
+                    order_id = response.get('data', {}).get('order_id')
+                    if order_id:
+                        # 更新訂單記錄
                         self.active_orders[order_id] = {
                             "price": price,
                             "side": side,
                             "quantity": quantity
                         }
                         self.grid_orders[price] = order_id
-                    
-                    # 添加到訂單追踪器
-                    symbol = self.market_info.symbol if self.market_info else "PERP_BTC_USDC"
-                    self.order_tracker.add_order(
-                        order_id=order_id,
-                        symbol=symbol,
-                        side=side,
-                        order_type="LIMIT",
-                        price=price,
-                        quantity=quantity
-                    )
-                    
-                    logger.info(f"網格訂單創建成功: ID={order_id}, 價格={price}, 方向={side}")
+                        
+                        # 添加到訂單追踪器
+                        self.order_tracker.add_order(
+                            order_id=order_id,
+                            symbol=symbol,
+                            side=side,
+                            order_type="LIMIT",
+                            price=Decimal(str(price)),
+                            quantity=Decimal(str(quantity))
+                        )
+                        
+                        logger.info(f"網格訂單創建成功: ID={order_id}, 價格={price}, 方向={side}")
+                    else:
+                        logger.error(f"API 響應中缺少 order_id: {response}")
+                        # 清理 PENDING 標記
+                        self.grid_orders.pop(price, None)
+                else:
+                    logger.error(f"創建訂單失敗: {response}")
+                    # 清理 PENDING 標記
+                    self.grid_orders.pop(price, None)
             
         except Exception as e:
             logger.error(f"創建網格訂單失敗: {e}")
+            # 異常時清理 PENDING 標記
+            async with self._orders_lock:
+                self.grid_orders.pop(price, None)
     
     async def _event_handler(self, event: Event):
         """統一事件處理器"""
@@ -397,23 +467,48 @@ class GridTradingBot:
             logger.error(f"創建反向網格訂單失敗: {e}")
     
     async def _handle_cancel_all_signal(self, symbol: str):
-        """處理取消所有訊號"""
+        """處理取消所有訊號（帶狀態一致性保護）"""
         try:
-            # 取消所有相關訂單
-            await self.client.cancel_all_orders(symbol)
+            logger.info(f"開始取消 {symbol} 的所有訂單")
             
-            # 清空活躍訂單記錄
+            # 先記錄當前狀態，用於回滾
             async with self._orders_lock:
-                self.active_orders.clear()
-                self.grid_orders.clear()
+                backup_active_orders = self.active_orders.copy()
+                backup_grid_orders = self.grid_orders.copy()
             
-            # 清空訂單追踪器
-            self.order_tracker.clear()
-            
-            logger.info(f"已取消 {symbol} 的所有訂單")
+            try:
+                # 取消所有相關訂單
+                response = await self.client.cancel_all_orders(symbol)
+                
+                # 檢查取消是否成功
+                if not response.get('success', True):
+                    logger.error(f"取消訂單 API 調用失敗: {response}")
+                    return
+                
+                # 成功後清空狀態
+                async with self._orders_lock:
+                    self.active_orders.clear()
+                    self.grid_orders.clear()
+                
+                # 清空訂單追踪器
+                self.order_tracker.clear()
+                
+                logger.info(f"已成功取消 {symbol} 的所有訂單")
+                
+            except Exception as api_error:
+                logger.error(f"取消訂單 API 調用異常: {api_error}")
+                
+                # API 調用失敗，恢復狀態（保守策略）
+                async with self._orders_lock:
+                    self.active_orders = backup_active_orders
+                    self.grid_orders = backup_grid_orders
+                
+                logger.warning("API 調用失敗，已恢復訂單狀態")
+                raise
             
         except Exception as e:
             logger.error(f"取消所有訂單失敗: {e}")
+            raise
     
     async def _handle_stop_signal(self, symbol: str):
         """處理停止訊號"""
@@ -529,7 +624,7 @@ class GridTradingBot:
             raise
     
     async def stop_grid_trading(self):
-        """停止網格交易"""
+        """停止網格交易（帶狀態清理）"""
         logger.info("停止網格交易機器人")
         
         if self.signal_generator:
@@ -542,6 +637,9 @@ class GridTradingBot:
         
         # 清空訂單追踪器
         self.order_tracker.clear()
+        
+        # 清空 WebSocket 事件去重記錄
+        self.processed_fills.clear()
         
         # 關閉 WebSocket 連接
         if self.wss_client:

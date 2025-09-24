@@ -25,6 +25,7 @@ dist/
 .cache/
 .mypy_cache/
 ruff_cache/
+tests/
 
 # Editors/OS
 .DS_Store
