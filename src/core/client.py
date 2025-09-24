@@ -10,7 +10,8 @@ from typing import Dict, Any, Optional
 import asyncio
 import logging
 import os
-import time
+from src.utils.retry_handler import RetryHandler, RetryConfig
+import asyncio
 
 # 設置日誌
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,13 @@ class OrderlyClient:
             orderly_account_id=os.getenv("ORDERLY_ACCOUNT_ID", "0x5e2cccd91ac05c8f1a9de15c629deffcf1de88abacf7bb7ac8d3b9d8e9317bb0"),
         )
         
+        # 重試處理器
+        self.retry_handler = RetryHandler(RetryConfig(
+            max_attempts=3,
+            base_delay=1.0,
+            max_delay=30.0
+        ))
+        
     async def create_limit_order(self, symbol: str, side: str, price: float, quantity: float) -> Dict[str, Any]:
         """
         創建限價訂單
@@ -39,9 +47,9 @@ class OrderlyClient:
         Returns:
             訂單響應
         """
-        try:
-            logger.info(f"創建限價訂單: {symbol} {side} @ {price} 數量: {quantity}")
-            
+        logger.info(f"創建限價訂單: {symbol} {side} @ {price} 數量: {quantity}")
+        
+        async def _create_order():
             response = await self.client.create_order(
                 symbol=symbol,
                 order_type="LIMIT",
@@ -49,10 +57,13 @@ class OrderlyClient:
                 order_price=price,
                 order_quantity=quantity,
             )
-            
+            await asyncio.sleep(0.1)  # 避免過快請求
+            return response
+        
+        try:
+            response = await self.retry_handler.retry_async(_create_order)
             logger.info(f"訂單創建成功: {response}")
             return response
-            
         except Exception as e:
             logger.error(f"創建訂單失敗: {e}")
             raise
@@ -69,20 +80,22 @@ class OrderlyClient:
         Returns:
             訂單響應
         """
-        try:
-            logger.info(f"創建市價訂單: {symbol} {side} 數量: {quantity}")
-            
+        logger.info(f"創建市價訂單: {symbol} {side} 數量: {quantity}")
+        
+        async def _create_market_order():
             response = await self.client.create_order(
                 symbol=symbol,
                 order_type="MARKET",
                 side=side,
                 order_quantity=quantity,
             )
-            
-            logger.info(f"市價訂單創建成功: {response}")
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             return response
-            
+        
+        try:
+            response = await self.retry_handler.retry_async(_create_market_order)
+            logger.info(f"市價訂單創建成功: {response}")
+            return response
         except Exception as e:
             logger.error(f"創建市價訂單失敗: {e}")
             raise
@@ -98,17 +111,18 @@ class OrderlyClient:
         Returns:
             取消響應
         """
-        try:
-            logger.info(f"取消訂單: {symbol} {order_id}")
-            
-            response = await self.client.cancel_order(
+        logger.info(f"取消訂單: {symbol} {order_id}")
+        
+        async def _cancel_order():
+            return await self.client.cancel_order(
                 symbol=symbol,
                 order_id=order_id
             )
-            
+        
+        try:
+            response = await self.retry_handler.retry_async(_cancel_order)
             logger.info(f"訂單取消成功: {response}")
             return response
-            
         except Exception as e:
             logger.error(f"取消訂單失敗: {e}")
             raise

@@ -8,6 +8,7 @@
 import math
 import asyncio
 import inspect
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional, Callable
 from enum import Enum
 from dataclasses import dataclass
@@ -26,8 +27,8 @@ class TradingSignal:
     """交易訊號數據類"""
     symbol: str
     side: OrderSide
-    price: float
-    size: float
+    price: Decimal
+    size: Decimal
     signal_type: str  # 'INITIAL', 'COUNTER', 'STOP'
     timestamp: float = None
     
@@ -56,14 +57,14 @@ class GridSignalGenerator:
             signal_callback: 訊號回調函數
         """
         self.ticker = ticker
-        self.current_price = current_price
+        self.current_price = Decimal(str(current_price))
         self.direction = direction
-        self.upper_bound = upper_bound
-        self.lower_bound = lower_bound
+        self.upper_bound = Decimal(str(upper_bound))
+        self.lower_bound = Decimal(str(lower_bound))
         self.grid_levels = grid_levels
-        self.total_amount = total_amount
-        self.stop_bot_price = stop_bot_price
-        self.stop_top_price = stop_top_price
+        self.total_amount = Decimal(str(total_amount))
+        self.stop_bot_price = Decimal(str(stop_bot_price)) if stop_bot_price else None
+        self.stop_top_price = Decimal(str(stop_top_price)) if stop_top_price else None
         self.signal_callback = signal_callback
         
         # 網格狀態控制
@@ -91,9 +92,9 @@ class GridSignalGenerator:
         self.amount_per_grid = total_amount / grid_levels
         
         # 找到最接近 current_price 的網格 index（用於參考）
-        self.center_index = self._find_closest_price_index(current_price)
+        self.center_index = self._find_closest_price_index(self.current_price)
     
-    def _calculate_grid_prices(self) -> List[float]:
+    def _calculate_grid_prices(self) -> List[Decimal]:
         """計算所有網格價格點"""
         prices = []
         
@@ -101,7 +102,7 @@ class GridSignalGenerator:
         for i in range(1, self.grid_levels_below + 1):
             price = self.current_price - i * self.price_below
             if price >= self.lower_bound:
-                prices.append(round(price, 2))
+                prices.append(price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         
         # 按價格從低到高排序
         prices.sort()
@@ -110,13 +111,13 @@ class GridSignalGenerator:
         for i in range(1, self.grid_levels_above + 1):
             price = self.current_price + i * self.price_above
             if price <= self.upper_bound:
-                prices.append(round(price, 2))
+                prices.append(price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         
         return prices
     
-    def _find_closest_price_index(self, price: float) -> int:
+    def _find_closest_price_index(self, price: Decimal) -> int:
         """找到最接近指定價格的網格 index"""
-        min_diff = float('inf')
+        min_diff = Decimal('inf')
         closest_index = 0
         for i, grid_price in enumerate(self.grid_prices):
             diff = abs(grid_price - price)
@@ -125,11 +126,11 @@ class GridSignalGenerator:
                 closest_index = i
         return closest_index
     
-    def _calculate_position_size(self, price: float) -> float:
+    def _calculate_position_size(self, price: Decimal) -> Decimal:
         """根據價格和每格金額計算倉位大小"""
-        return round(self.amount_per_grid / price, 6)
+        return (self.amount_per_grid / price).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
     
-    def _emit_signal(self, side: OrderSide, price: float, size: float, signal_type: str) -> TradingSignal:
+    def _emit_signal(self, side: OrderSide, price: Decimal, size: Decimal, signal_type: str) -> TradingSignal:
         """
         生成交易訊號並通過回調函數發送
         
@@ -215,7 +216,7 @@ class GridSignalGenerator:
         """
         self.stop_grid("接收停止訊號")
     
-    def check_stop_conditions(self, current_price: float) -> bool:
+    def check_stop_conditions(self, current_price: Decimal) -> bool:
         """
         檢查停損條件
         
