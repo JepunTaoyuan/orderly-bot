@@ -31,6 +31,16 @@ app = FastAPI(title="Grid Trading Server (MVP)")
 # 全域會話管理器
 session_manager = SessionManager()
 
+class RegisterConfig(BaseModel):
+    user_id: str = Field(..., example="user123")
+    user_api_key: str = Field(..., example="user123")
+    user_api_secret: str = Field(..., example="user123")
+    user_wallet_address: str = Field(..., example="user123")
+
+@app.post("/api/enable")
+async def enable_bot_trading(config: RegisterConfig):
+    """啟用機器人交易 儲存用戶資料進database"""
+    pass
 
 class StartConfig(BaseModel):
     ticker: str = Field(..., example="BTCUSDT")
