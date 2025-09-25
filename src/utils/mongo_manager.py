@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 class MongoManager:
     def __init__(self, connection_string: str) -> None:
         self.client = MongoClient(connection_string)
-        self.db = self.client['your_app']
+        self.db = self.client.get_default_database()
         self.users = self.db['users']
     
     def create_user(self, user_id: str, api_key: str, api_secret: str, 

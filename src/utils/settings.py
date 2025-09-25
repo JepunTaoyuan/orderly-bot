@@ -37,6 +37,7 @@ def get_settings() -> Settings:
       - ORDERLY_KEY
       - ORDERLY_SECRET
       - ORDERLY_ACCOUNT_ID
+      - MONGO_URI
 
     Optional:
       - ORDERLY_TESTNET (default: true)
@@ -45,6 +46,7 @@ def get_settings() -> Settings:
     """
     key = os.getenv("ORDERLY_KEY")
     secret = os.getenv("ORDERLY_SECRET")
+    mongo_uri = os.getenv("MONGO_URI")
     account_id = os.getenv("ORDERLY_ACCOUNT_ID")
 
     missing = [
@@ -53,6 +55,7 @@ def get_settings() -> Settings:
             ("ORDERLY_KEY", key),
             ("ORDERLY_SECRET", secret),
             ("ORDERLY_ACCOUNT_ID", account_id),
+            ("MONGO_URI", mongo_uri),
         )
         if not val
     ]
