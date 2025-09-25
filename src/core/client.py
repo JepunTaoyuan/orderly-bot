@@ -245,33 +245,3 @@ class OrderlyClient:
         except Exception as e:
             logger.error(f"平倉失敗: {e}")
             raise
-
-
-async def main():
-    """測試函數"""
-    client = OrderlyClient()
-    
-    try:
-        # 測試獲取帳戶信息
-        account_info = await client.get_account_info()
-        print("帳戶信息:", account_info)
-        
-        # 測試獲取持倉
-        positions = await client.get_positions()
-        print("持倉信息:", positions)
-        
-        # 測試創建限價訂單
-        # response = await client.create_limit_order(
-        #     symbol="PERP_BTC_USDC",
-        #     side="BUY",
-        #     price=100000,
-        #     quantity=0.001
-        # )
-        # print("訂單響應:", response)
-        
-    except Exception as e:
-        print(f"測試失敗: {e}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

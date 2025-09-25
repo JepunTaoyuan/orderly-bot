@@ -51,6 +51,12 @@ class ErrorCode(Enum):
     ORDERLY_CONNECTION_ERROR = "E6001"
     ORDERLY_RATE_LIMIT = "E6002"
     ORDERLY_TIMEOUT = "E6003"
+    
+    # 用戶管理錯誤 (7000-7999)
+    USER_ALREADY_EXISTS = "E7000"
+    USER_NOT_FOUND = "E7001"
+    USER_CREATION_FAILED = "E7002"
+    USER_UPDATE_FAILED = "E7003"
 
 
 @dataclass
@@ -220,6 +226,36 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         description="Orderly API rate limit has been exceeded",
         http_status=429,
         user_message="請求過於頻繁，請稍後重試"
+    ),
+    
+    # 用戶管理錯誤
+    ErrorCode.USER_ALREADY_EXISTS: ErrorDetail(
+        code=ErrorCode.USER_ALREADY_EXISTS,
+        message="User already exists",
+        description="A user with the same ID already exists",
+        http_status=409,
+        user_message="用戶已存在"
+    ),
+    ErrorCode.USER_NOT_FOUND: ErrorDetail(
+        code=ErrorCode.USER_NOT_FOUND,
+        message="User not found",
+        description="The requested user does not exist",
+        http_status=404,
+        user_message="找不到指定的用戶"
+    ),
+    ErrorCode.USER_CREATION_FAILED: ErrorDetail(
+        code=ErrorCode.USER_CREATION_FAILED,
+        message="Failed to create user",
+        description="Failed to create a new user",
+        http_status=500,
+        user_message="創建用戶失敗"
+    ),
+    ErrorCode.USER_UPDATE_FAILED: ErrorDetail(
+        code=ErrorCode.USER_UPDATE_FAILED,
+        message="Failed to update user",
+        description="Failed to update user information",
+        http_status=500,
+        user_message="更新用戶信息失敗"
     ),
 }
 

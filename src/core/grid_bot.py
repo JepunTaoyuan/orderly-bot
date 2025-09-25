@@ -6,7 +6,6 @@
 """
 
 import asyncio
-import logging
 import json
 import time
 from decimal import Decimal
@@ -37,6 +36,7 @@ class GridTradingBot:
         self.validator = MarketValidator()  # 市場驗證器
         self.market_info = None  # 當前市場信息
         self.order_tracker = OrderTracker()  # 訂單追踪器
+        self.session_id = None  # 會話ID，用於生成唯一的 WebSocket ID
         
         # WebSocket 事件去重
         self.processed_fills = set()  # 記錄已處理的成交ID
@@ -74,63 +74,72 @@ class GridTradingBot:
     
     def _setup_websocket(self):
         """設置 WebSocket 連接監聽訂單成交"""
-        def on_close(_):
-            logger.info("WebSocket 連接已關閉")
+        try:
+            settings = get_settings()
+            
+            def on_close(_):
+                logger.info("WebSocket 連接已關閉")
 
-        def on_message(_, message):
-            """處理 WebSocket 訊息"""
-            try:
-                data = json.loads(message) if isinstance(message, str) else message
-                
-                # 檢查是否為訂單成交通知
-                if (data.get("topic") == "notifications" and 
-                    data.get("data", {}).get("messageType") == "ORDER_FILLED_PUSH"):
+            def on_message(_, message):
+                """處理 WebSocket 訊息"""
+                try:
+                    data = json.loads(message) if isinstance(message, str) else message
                     
-                    # 解析成交信息
-                    content_raw = data["data"]["contentRaw"]
-                    fill_data = json.loads(content_raw)
-                    
-                    order_id = fill_data["orderId"]
-                    executed_price = fill_data["executedPrice"]
-                    executed_quantity = fill_data["executedQuantity"]
-                    side = fill_data["side"]
-                    
-                    logger.info("訂單成交", event_type="order_filled", data={
-                        "order_id": order_id,
-                        "price": executed_price,
-                        "quantity": executed_quantity,
-                        "side": side
-                    })
-                    
-                    # 記錄指標
-                    metrics.increment_counter("orders.filled", tags={"side": side})
-                    metrics.record_histogram("order.fill_price", float(executed_price))
-                    metrics.record_histogram("order.fill_quantity", float(executed_quantity))
-                    
-                    # 將訂單成交事件添加到隊列
-                    if self.event_queue:
-                        fill_data = {
+                    # 檢查是否為訂單成交通知
+                    if (data.get("topic") == "notifications" and 
+                        data.get("data", {}).get("messageType") == "ORDER_FILLED_PUSH"):
+                        
+                        # 解析成交信息
+                        content_raw = data["data"]["contentRaw"]
+                        fill_data = json.loads(content_raw)
+                        
+                        order_id = fill_data["orderId"]
+                        executed_price = fill_data["executedPrice"]
+                        executed_quantity = fill_data["executedQuantity"]
+                        side = fill_data["side"]
+                        
+                        logger.info("訂單成交", event_type="order_filled", data={
                             "order_id": order_id,
-                            "executed_price": executed_price,
-                            "executed_quantity": executed_quantity,
+                            "price": executed_price,
+                            "quantity": executed_quantity,
                             "side": side
-                        }
-                        event = Event(EventType.ORDER_FILLED, fill_data)
-                        asyncio.create_task(self.event_queue.add_event(event))
-                    
-            except Exception as e:
-                logger.error(f"處理 WebSocket 訊息失敗: {e}")
+                        })
+                        
+                        # 記錄指標
+                        metrics.increment_counter("orders.filled", tags={"side": side})
+                        metrics.record_histogram("order.fill_price", float(executed_price))
+                        metrics.record_histogram("order.fill_quantity", float(executed_quantity))
+                        
+                        # 將訂單成交事件添加到隊列
+                        if self.event_queue:
+                            fill_data = {
+                                "order_id": order_id,
+                                "executed_price": executed_price,
+                                "executed_quantity": executed_quantity,
+                                "side": side
+                            }
+                            event = Event(EventType.ORDER_FILLED, fill_data)
+                            asyncio.create_task(self.event_queue.add_event(event))
+                        
+                except Exception as e:
+                    logger.error(f"處理 WebSocket 訊息失敗: {e}")
 
-        settings = get_settings()
-        self.wss_client = WebsocketPrivateAPIClient(
-            orderly_testnet=settings.orderly_testnet,
-            orderly_account_id=settings.orderly_account_id,
-            orderly_key=settings.orderly_key,
-            orderly_secret=settings.orderly_secret,
-            on_message=on_message,
-            on_close=on_close,
-            debug=True,
-        )
+            # 創建 WebSocket 客戶端
+            # 使用 session_id 作為 wss_id 確保每個會話都有唯一的 WebSocket 連接
+            wss_id = self.session_id or "grid_bot_default"
+            self.wss_client = WebsocketPrivateAPIClient(
+                orderly_testnet=settings.orderly_testnet,
+                orderly_account_id=settings.orderly_account_id,
+                wss_id=wss_id,
+                orderly_key=settings.orderly_key,
+                orderly_secret=settings.orderly_secret,
+                on_message=on_message,
+                on_close=on_close,
+            )
+            
+        except Exception as e:
+            logger.warning(f"設置 WebSocket 連接失敗: {e}")
+            self.wss_client = None
     
     async def _handle_order_filled_event(self, fill_data: Dict[str, Any]):
         """
@@ -280,7 +289,7 @@ class GridTradingBot:
                     return
             
             # 創建限價訂單
-            symbol = self.market_info.symbol if self.market_info else "PERP_BTC_USDC"
+            symbol = self.market_info.symbol 
             response = await self.client.create_limit_order(
                 symbol=symbol,
                 side=side,
@@ -548,6 +557,7 @@ class GridTradingBot:
         try:
             # 設置會話上下文
             session_id = f"{config['user_id']}_{config['ticker']}"
+            self.session_id = session_id  # 保存 session_id 供 WebSocket 使用
             set_session_context(session_id)
             
             logger.info("啟動網格交易機器人", event_type="bot_start", data={

@@ -14,6 +14,9 @@ import asyncio
 import time
 from typing import Optional
 
+from dotenv import load_dotenv
+import os
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
@@ -25,7 +28,9 @@ from src.utils.logging_config import configure_logging, get_logger, metrics, set
 from src.utils.error_codes import GridTradingException, ErrorCode
 from src.utils.market_validator import ValidationError
 from src.utils.api_helpers import SessionContextManager, validate_session_id, create_session_id
+from src.utils.mongo_manager import MongoManager
 
+load_dotenv()
 
 # 配置日誌
 configure_logging(level="INFO", format_json=True)
@@ -35,6 +40,9 @@ app = FastAPI(title="Grid Trading Server (MVP)")
 
 # 全域會話管理器
 session_manager = SessionManager()
+
+# 全域MongoDB管理器
+mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
 
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
@@ -85,10 +93,96 @@ class RegisterConfig(BaseModel):
     user_api_secret: str
     user_wallet_address: str
 
-@app.post("/api/enable")
+@app.post("/api/user/enable")
 async def enable_bot_trading(config: RegisterConfig):
     """啟用機器人交易 儲存用戶資料進database"""
-    pass
+    try:
+        # 檢查用戶是否已存在
+        if mongo_manager.get_user(config.user_id):
+            raise GridTradingException(
+                error_code=ErrorCode.USER_ALREADY_EXISTS,
+                details={"user_id": config.user_id}
+            )
+        
+        # 創建用戶
+        result = mongo_manager.create_user(
+            config.user_id, 
+            config.user_api_key, 
+            config.user_api_secret, 
+            config.user_wallet_address
+        )
+        
+        if not result.inserted_id:
+            raise GridTradingException(
+                error_code=ErrorCode.USER_CREATION_FAILED,
+                details={"user_id": config.user_id}
+            )
+            
+        return {"message": "success", "user_id": config.user_id}
+        
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("創建用戶失敗", event_type="user_creation_error", data={
+            "user_id": config.user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.USER_CREATION_FAILED,
+            details={"user_id": config.user_id},
+            original_error=e
+        )
+
+class UpdateConfig(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "user_id": "user123",
+            "user_api_key": "user123",
+            "user_api_secret": "user123"
+        }
+    })
+    
+    user_id: str
+    user_api_key: str
+    user_api_secret: str
+
+@app.put("/api/user/update")
+async def update_user_data(config: UpdateConfig):
+    """更新機器人交易 儲存用戶資料進database"""
+    try:
+        # 檢查用戶是否存在
+        if not mongo_manager.get_user(config.user_id):
+            raise GridTradingException(
+                error_code=ErrorCode.USER_NOT_FOUND,
+                details={"user_id": config.user_id}
+            )
+        
+        # 更新用戶
+        result = mongo_manager.update_user(config.user_id, {
+            "api_key": config.user_api_key,
+            "api_secret": config.user_api_secret,
+        })
+        
+        if result.modified_count == 0 and result.matched_count == 0:
+            raise GridTradingException(
+                error_code=ErrorCode.USER_UPDATE_FAILED,
+                details={"user_id": config.user_id}
+            )
+            
+        return {"message": "success", "user_id": config.user_id}
+        
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("更新用戶失敗", event_type="user_update_error", data={
+            "user_id": config.user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.USER_UPDATE_FAILED,
+            details={"user_id": config.user_id},
+            original_error=e
+        )
 
 class StartConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
@@ -278,11 +372,6 @@ async def get_status(session_id: str):
             details={"session_id": session_id},
             original_error=e
         )
-    except HTTPException:
-        # 直接傳遞既有的 HTTP 錯誤（例如 404）
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"failed_to_get_status: {e}")
 
 @app.get("/api/grid/sessions")
 async def list_sessions():

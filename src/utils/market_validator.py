@@ -8,7 +8,6 @@ import logging
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
-from enum import Enum
 
 logger = logging.getLogger(__name__)
 
