@@ -254,6 +254,13 @@ class StartConfig(BaseModel):
 
 @app.post("/api/grid/start")
 async def start_grid(config: StartConfig):
+    # 檢查 user_id 是否存在
+    if not mongo_manager.get_user(config.user_id):
+        raise GridTradingException(
+            error_code=ErrorCode.USER_NOT_FOUND,
+            details={"user_id": config.user_id}
+        )
+
     session_id = create_session_id(config.user_id, config.ticker)
     
     with SessionContextManager(session_id):

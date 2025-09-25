@@ -92,6 +92,10 @@ open http://localhost:8000/docs
 - `GET /api/grid/status/{session_id}` - 獲取會話狀態
 - `GET /api/grid/sessions` - 列出所有會話
 
+### 用戶管理端點
+- `POST /api/user/enable` - 註冊用戶並啟用機器人交易
+- `PUT /api/user/update` - 更新用戶 API 憑證
+
 ### 系統監控端點
 - `GET /health` - 健康檢查
 - `GET /health/ready` - 就緒檢查
@@ -131,9 +135,10 @@ open http://localhost:8000/docs
 
 ### 必要環境變數
 ```bash
-ORDERLY_KEY=ed25519:your_private_key        # Orderly 私鑰
-ORDERLY_SECRET=ed25519:your_secret_key      # Orderly 密鑰
-ORDERLY_ACCOUNT_ID=0x...                    # Orderly 帳戶 ID
+ORDERLY_KEY=ed25519:your_private_key        # Orderly 私鑰（僅用於系統管理）
+ORDERLY_SECRET=ed25519:your_secret_key      # Orderly 密鑰（僅用於系統管理）
+ORDERLY_ACCOUNT_ID=0x...                    # Orderly 帳戶 ID（僅用於系統管理）
+MONGODB_URI=mongodb://...                   # MongoDB 連接字符串
 ```
 
 ### 可選環境變數

@@ -9,6 +9,8 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from src.core.grid_bot import GridTradingBot
+from src.utils.mongo_manager import MongoManager
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ class SessionManager:
         """初始化會話管理器"""
         self.sessions: Dict[str, GridTradingBot] = {}
         self._sessions_lock = asyncio.Lock()
+        self.mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
     
     async def create_session(self, session_id: str, config: Dict[str, Any]) -> bool:
         """
@@ -35,8 +38,33 @@ class SessionManager:
                 return False
             
             try:
-                bot = GridTradingBot()
-                await bot.start_grid_trading(config)
+                # 從數據庫獲取用戶憑證
+                user_id = config.get('user_id')
+                if not user_id:
+                    raise ValueError("配置中缺少 user_id")
+                
+                user_data = self.mongo_manager.get_user(user_id)
+                if not user_data:
+                    raise ValueError(f"用戶 {user_id} 不存在")
+                
+                # 創建 GridTradingBot 實例，傳入用戶憑證
+                bot = GridTradingBot(
+                    account_id=user_data.get('evm_wallet_address'),  # 使用錢包地址作為 account_id
+                    orderly_key=user_data.get('api_key'),
+                    orderly_secret=user_data.get('api_secret'),
+                    orderly_testnet=True  # 可以從配置或環境變數獲取
+                )
+                
+                # 將用戶憑證添加到配置中，供 GridTradingBot 使用
+                enhanced_config = config.copy()
+                enhanced_config.update({
+                    'orderly_account_id': user_data.get('evm_wallet_address'),
+                    'orderly_key': user_data.get('api_key'),
+                    'orderly_secret': user_data.get('api_secret'),
+                    'orderly_testnet': True
+                })
+                
+                await bot.start_grid_trading(enhanced_config)
                 self.sessions[session_id] = bot
                 logger.info(f"會話 {session_id} 創建成功")
                 return True

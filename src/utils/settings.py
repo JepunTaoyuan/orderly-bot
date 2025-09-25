@@ -25,6 +25,9 @@ class Settings:
     uvicorn_host: str = "0.0.0.0"
     uvicorn_port: int = 8000
 
+    # Database connection
+    mongo_uri: str
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

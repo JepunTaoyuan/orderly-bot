@@ -9,7 +9,6 @@ from orderly_evm_connector.rest import RestAsync
 from typing import Dict, Any, Optional
 import asyncio
 from src.utils.retry_handler import RetryHandler, RetryConfig
-from src.utils.settings import get_settings
 from src.utils.logging_config import get_logger
 from src.utils.api_helpers import with_orderly_api_handling
 
@@ -17,14 +16,13 @@ from src.utils.api_helpers import with_orderly_api_handling
 logger = get_logger("orderly_client")
 
 class OrderlyClient:
-    def __init__(self):
+    def __init__(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
         """初始化 Orderly 客戶端"""
-        settings = get_settings()
         self.client = RestAsync(
-            orderly_key=settings.orderly_key,
-            orderly_secret=settings.orderly_secret,
-            orderly_testnet=settings.orderly_testnet,
-            orderly_account_id=settings.orderly_account_id,
+            orderly_key=orderly_key,
+            orderly_secret=orderly_secret,
+            orderly_testnet=orderly_testnet,
+            orderly_account_id=account_id,
         )
         
         # 重試處理器

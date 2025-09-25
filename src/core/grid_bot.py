@@ -17,15 +17,14 @@ from src.utils.market_validator import MarketValidator, ValidationError
 from src.utils.order_tracker import OrderTracker, OrderStatus
 from src.utils.logging_config import get_logger, metrics, set_session_context
 from orderly_evm_connector.websocket.websocket_api import WebsocketPrivateAPIClient
-from src.utils.settings import get_settings
 
 # 使用結構化日誌
 logger = get_logger("grid_bot")
 
 class GridTradingBot:
-    def __init__(self):
-        """初始化網格交易機器人"""
-        self.client = OrderlyClient()
+    def __init__(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
+        """初始化網格交易機器人"""  
+        self.client = OrderlyClient(account_id = account_id, orderly_key = orderly_key, orderly_secret = orderly_secret, orderly_testnet = orderly_testnet)
         self.signal_generator = None
         self.active_orders = {}  # 記錄活躍訂單 {order_id: {"price": price, "side": side, "quantity": quantity}}
         self.grid_orders = {}    # 記錄網格訂單 {price: order_id}
@@ -72,10 +71,9 @@ class GridTradingBot:
         # 若無任何已知關閉方法，忽略但記錄
         logger.warning("WebSocket 客戶端不支援顯式關閉方法，已略過")
     
-    def _setup_websocket(self):
+    def _setup_websocket(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
         """設置 WebSocket 連接監聽訂單成交"""
         try:
-            settings = get_settings()
             
             def on_close(_):
                 logger.info("WebSocket 連接已關閉")
@@ -128,11 +126,11 @@ class GridTradingBot:
             # 使用 session_id 作為 wss_id 確保每個會話都有唯一的 WebSocket 連接
             wss_id = self.session_id or "grid_bot_default"
             self.wss_client = WebsocketPrivateAPIClient(
-                orderly_testnet=settings.orderly_testnet,
-                orderly_account_id=settings.orderly_account_id,
+                orderly_testnet=orderly_testnet,
+                orderly_account_id=account_id,
                 wss_id=wss_id,
-                orderly_key=settings.orderly_key,
-                orderly_secret=settings.orderly_secret,
+                orderly_key=orderly_key,
+                orderly_secret=orderly_secret,
                 on_message=on_message,
                 on_close=on_close,
             )
@@ -587,7 +585,12 @@ class GridTradingBot:
             await self.event_queue.start()
             
             # 設置 WebSocket 連接
-            self._setup_websocket()
+            self._setup_websocket(
+                account_id=config['orderly_account_id'],
+                orderly_key=config['orderly_key'],
+                orderly_secret=config['orderly_secret'],
+                orderly_testnet=config['orderly_testnet']
+            )
             
             # 啟動 WebSocket 監聽
             try:
