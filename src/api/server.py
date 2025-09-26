@@ -29,6 +29,9 @@ from src.utils.error_codes import GridTradingException, ErrorCode
 from src.utils.market_validator import ValidationError
 from src.utils.api_helpers import SessionContextManager, validate_session_id, create_session_id
 from src.utils.mongo_manager import MongoManager
+from fastapi.middleware.cors import CORSMiddleware
+from src.utils.wallet_sig_verify import WalletSignatureVerifier
+
 
 load_dotenv()
 
@@ -36,7 +39,19 @@ load_dotenv()
 configure_logging(level="INFO", format_json=True)
 logger = get_logger("main")
 
-app = FastAPI(title="Grid Trading Server (MVP)")
+app = FastAPI(title="Grid Trading Server", version="1.0.0")
+
+# 錢包簽名驗證器
+wallet_verifier = WalletSignatureVerifier()
+
+#For test
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 全域會話管理器
 session_manager = SessionManager()
@@ -138,7 +153,7 @@ class UpdateConfig(BaseModel):
         "example": {
             "user_id": "user123",
             "user_api_key": "user123",
-            "user_api_secret": "user123"
+            "user_api_secret": "user123",
         }
     })
     
@@ -260,6 +275,27 @@ async def start_grid(config: StartConfig):
             error_code=ErrorCode.USER_NOT_FOUND,
             details={"user_id": config.user_id}
         )
+    
+    # 檢驗 user_sig
+    wallet_address = mongo_manager.get_user(config.user_id)['wallet_address']
+    wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
+    if wallet_type == 'evm':
+        if not wallet_verifier.verify_evm_signature(config.user_sig, wallet_address):
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_SIGNATURE,
+                details={"user_id": config.user_id, "wallet_type": wallet_type}
+            )
+    elif wallet_type == 'solana':
+        if not wallet_verifier.verify_solana_signature(config.user_sig, wallet_address):
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_SIGNATURE,
+                details={"user_id": config.user_id, "wallet_type": wallet_type}
+            )
+    else:
+        raise GridTradingException(
+            error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
+            details={"user_id": config.user_id, "wallet_type": wallet_type}
+        )
 
     session_id = create_session_id(config.user_id, config.ticker)
     
@@ -312,16 +348,40 @@ async def start_grid(config: StartConfig):
 class StopConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "session_id": "user123_BTCUSDT"
+            "session_id": "user123_BTCUSDT",
+            "user_sig": "user123"
         }
     })
     
     session_id: str = Field(..., min_length=1)
+    user_sig: str = Field(..., min_length=1)
 
 @app.post("/api/grid/stop")
 async def stop_grid(config: StopConfig):
     session_id = validate_session_id(config.session_id)
     
+    # 檢驗 user_sig
+    user_id = session_id.split('_')[-2]
+    wallet_address = mongo_manager.get_user(user_id)['wallet_address']
+    wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
+    if wallet_type == 'evm':
+        if not wallet_verifier.verify_evm_signature(config.user_sig, wallet_address):
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_SIGNATURE,
+                details={"user_id": user_id, "wallet_type": wallet_type}
+            )
+    elif wallet_type == 'solana':
+        if not wallet_verifier.verify_solana_signature(config.user_sig, wallet_address):
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_SIGNATURE,
+                details={"user_id": user_id, "wallet_type": wallet_type}
+            )
+    else:
+        raise GridTradingException(
+            error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
+            details={"user_id": user_id, "wallet_type": wallet_type}
+        )
+
     with SessionContextManager(session_id):
         try:
             logger.info("停止網格交易請求", event_type="grid_stop", data={"session_id": session_id})
@@ -452,4 +512,3 @@ async def root():
         "version": "1.0.0",
         "WHATUP": "BRO"
     }
-# Entry point moved to root main.py
