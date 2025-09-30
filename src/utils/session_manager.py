@@ -18,6 +18,7 @@ class SessionManager:
     def __init__(self):
         """初始化會話管理器"""
         self.sessions: Dict[str, GridTradingBot] = {}
+        self._creating_sessions: set = set()  # 追踪正在創建的會話
         self._sessions_lock = asyncio.Lock()
         self.mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
     
@@ -37,7 +38,14 @@ class SessionManager:
                 logger.warning(f"會話 {session_id} 已存在")
                 return False
 
-            try:
+            if session_id in self._creating_sessions:
+                logger.warning(f"會話 {session_id} 正在創建中")
+                return False
+
+            # 標記為創建中
+            self._creating_sessions.add(session_id)
+
+        try:
                 # 從數據庫獲取用戶憑證
                 user_id = config.get('user_id')
                 if not user_id:
@@ -66,13 +74,22 @@ class SessionManager:
                 })
                 
                 await bot.start_grid_trading(enhanced_config)
-                self.sessions[session_id] = bot
+
+                async with self._sessions_lock:
+                    self.sessions[session_id] = bot
+                    self._creating_sessions.discard(session_id)
+
                 logger.info(f"會話 {session_id} 創建成功")
                 return True
-            except Exception as e:
-                logger.error(f"創建會話 {session_id} 失敗: {e}")
-                # 重要：不要吞掉例外，讓上層決定回應碼（例如 500）
-                raise
+
+        except Exception as e:
+            # 清理創建中標記
+            async with self._sessions_lock:
+                self._creating_sessions.discard(session_id)
+
+            logger.error(f"創建會話 {session_id} 失敗: {e}")
+            # 重要：不要吞掉例外，讓上層決定回應碼（例如 500）
+            raise
     
     async def stop_session(self, session_id: str) -> bool:
         """

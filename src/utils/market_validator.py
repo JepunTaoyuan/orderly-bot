@@ -52,6 +52,46 @@ class MarketValidator:
                 max_price=Decimal("100000"),
                 min_quantity=Decimal("0.001"),
                 max_quantity=Decimal("100")
+            ),
+            "PERP_SOL_USDC": MarketInfo(
+                symbol="PERP_SOL_USDC",
+                tick_size=Decimal("0.001"),
+                step_size=Decimal("0.01"),
+                min_notional=Decimal("1.0"),
+                min_price=Decimal("0.001"),
+                max_price=Decimal("10000"),
+                min_quantity=Decimal("0.01"),
+                max_quantity=Decimal("10000")
+            ),
+            "PERP_NEAR_USDC": MarketInfo(
+                symbol="PERP_NEAR_USDC",
+                tick_size=Decimal("0.001"),
+                step_size=Decimal("0.1"),
+                min_notional=Decimal("1.0"),
+                min_price=Decimal("0.001"),
+                max_price=Decimal("1000"),
+                min_quantity=Decimal("0.1"),
+                max_quantity=Decimal("100000")
+            ),
+            "PERP_ARB_USDC": MarketInfo(
+                symbol="PERP_ARB_USDC",
+                tick_size=Decimal("0.0001"),
+                step_size=Decimal("0.1"),
+                min_notional=Decimal("1.0"),
+                min_price=Decimal("0.0001"),
+                max_price=Decimal("100"),
+                min_quantity=Decimal("0.1"),
+                max_quantity=Decimal("100000")
+            ),
+            "PERP_OP_USDC": MarketInfo(
+                symbol="PERP_OP_USDC",
+                tick_size=Decimal("0.001"),
+                step_size=Decimal("0.1"),
+                min_notional=Decimal("1.0"),
+                min_price=Decimal("0.001"),
+                max_price=Decimal("1000"),
+                min_quantity=Decimal("0.1"),
+                max_quantity=Decimal("100000")
             )
         }
     
@@ -214,18 +254,26 @@ class MarketValidator:
     def _convert_symbol(self, symbol: str) -> str:
         """
         轉換符號格式
-        
+
         Args:
             symbol: 原始符號 (如 BTCUSDT)
-            
+
         Returns:
             Orderly格式符號 (如 PERP_BTC_USDC)
         """
         symbol_map = {
             "BTCUSDT": "PERP_BTC_USDC",
             "ETHUSDT": "PERP_ETH_USDC",
+            "SOLUSDT": "PERP_SOL_USDC",
+            "NEARUSDT": "PERP_NEAR_USDC",
+            "ARBUSDT": "PERP_ARB_USDC",
+            "OPUSDT": "PERP_OP_USDC",
             "BTCUSDC": "PERP_BTC_USDC",
-            "ETHUSDC": "PERP_ETH_USDC"
+            "ETHUSDC": "PERP_ETH_USDC",
+            "SOLUSDC": "PERP_SOL_USDC",
+            "NEARUSDC": "PERP_NEAR_USDC",
+            "ARBUSDC": "PERP_ARB_USDC",
+            "OPUSDC": "PERP_OP_USDC",
         }
-        
+
         return symbol_map.get(symbol.upper(), symbol)

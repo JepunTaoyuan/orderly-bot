@@ -52,9 +52,29 @@ class GridTradingBot:
         將訊號生成器的符號轉換為 Orderly 格式
         例如: BTCUSDT -> PERP_BTC_USDC
         """
-        if symbol == "BTCUSDT":
-            return "PERP_BTC_USDC"
-        # 可以根據需要添加更多轉換規則
+        # 標準化符號格式（移除可能的 USDC 後綴）
+        symbol_upper = symbol.upper().replace("USDC", "").replace("USDT", "")
+
+        # 符號映射表（與 market_validator.py 保持一致）
+        symbol_map = {
+            "BTC": "PERP_BTC_USDC",
+            "ETH": "PERP_ETH_USDC",
+            "SOL": "PERP_SOL_USDC",
+            "NEAR": "PERP_NEAR_USDC",
+            "ARB": "PERP_ARB_USDC",
+            "OP": "PERP_OP_USDC",
+        }
+
+        # 如果已經是 Orderly 格式（以 PERP_ 開頭），直接返回
+        if symbol.startswith("PERP_"):
+            return symbol
+
+        # 嘗試映射
+        if symbol_upper in symbol_map:
+            return symbol_map[symbol_upper]
+
+        # 如果找不到映射，記錄警告並返回原始值
+        logger.warning(f"無法轉換交易對符號: {symbol}，使用原始值")
         return symbol
     
     def _convert_side(self, side: OrderSide) -> str:
@@ -82,45 +102,61 @@ class GridTradingBot:
         try:
             
             def on_close(_):
-                logger.info("WebSocket 連接已關閉")
+                logger.warning("WebSocket 連接已關閉")
+
+            def on_error(_, error):
+                """WebSocket 錯誤處理"""
+                logger.error(f"WebSocket 錯誤: {error}", event_type="websocket_error")
+                # 如果是認證錯誤，停止交易
+                if "authentication" in str(error).lower() or "auth" in str(error).lower():
+                    logger.critical("WebSocket 認證失敗，停止交易")
+                    asyncio.create_task(self.stop_grid_trading())
 
             def on_message(_, message):
                 """處理 WebSocket 訊息"""
                 try:
                     data = json.loads(message) if isinstance(message, str) else message
-                    
+
                     # 檢查是否為訂單成交通知
-                    if (data.get("topic") == "notifications" and 
-                        data.get("data", {}).get("messageType") == "ORDER_FILLED_PUSH"):
-                        
+                    if (data.get("topic") == "notifications" and
+                        data.get("data", {}).get("messageType") == "ORDER_FILLED"):
+
                         # 解析成交信息
                         content_raw = data["data"]["contentRaw"]
-                        fill_data = json.loads(content_raw)
-                        
-                        order_id = fill_data["orderId"]
-                        executed_price = fill_data["executedPrice"]
-                        executed_quantity = fill_data["executedQuantity"]
-                        side = fill_data["side"]
-                        
+
+                        order_id = content_raw["orderId"]
+                        executed_price = content_raw["executedPrice"]
+                        executed_quantity = content_raw["executedQuantity"]
+                        side = content_raw["side"]
+                        symbol = content_raw.get("symbol", "")
+                        executed_timestamp = content_raw.get("executedTimestamp", 0)
+
+                        # 生成唯一的 fill_id（防止重複處理）
+                        fill_id = f"{order_id}_{executed_price}_{executed_quantity}_{executed_timestamp}"
+
                         logger.info("訂單成交", event_type="order_filled", data={
                             "order_id": order_id,
+                            "symbol": symbol,
                             "price": executed_price,
                             "quantity": executed_quantity,
-                            "side": side
+                            "side": side,
+                            "timestamp": executed_timestamp,
+                            "fill_id": fill_id
                         })
-                        
+
                         # 記錄指標
                         metrics.increment_counter("orders.filled", tags={"side": side})
                         metrics.record_histogram("order.fill_price", float(executed_price))
                         metrics.record_histogram("order.fill_quantity", float(executed_quantity))
-                        
+
                         # 將訂單成交事件添加到隊列
                         if self.event_queue:
                             fill_data = {
                                 "order_id": order_id,
                                 "executed_price": executed_price,
                                 "executed_quantity": executed_quantity,
-                                "side": side
+                                "side": side,
+                                "fill_id": fill_id
                             }
                             event = Event(EventType.ORDER_FILLED, fill_data)
                             asyncio.create_task(self.event_queue.add_event(event))
@@ -139,6 +175,7 @@ class GridTradingBot:
                 orderly_secret=orderly_secret,
                 on_message=on_message,
                 on_close=on_close,
+                on_error=on_error,
             )
             
         except Exception as e:
@@ -616,12 +653,14 @@ class GridTradingBot:
                 orderly_testnet=config['orderly_testnet']
             )
             
-            # 啟動 WebSocket 監聽
+            # 啟動 WebSocket 監聽 - 訂閱通知（包含訂單成交通知）
             try:
                 self.wss_client.get_notifications()
+                logger.info("WebSocket 訂閱 notifications 成功")
             except Exception as e:
-                # 在測試/某些環境中，可能沒有實作；記錄但不中斷啟動
-                logger.warning(f"啟動 WebSocket 通知監聽失敗: {e}")
+                # WebSocket 訂閱失敗是嚴重問題，應該記錄錯誤
+                logger.error(f"WebSocket 訂閱 notifications 失敗: {e}")
+                # 在測試環境中可能沒有實現，所以只記錄不中斷
             
             # 創建訊號生成器（僅用於初始網格設置）
             self.signal_generator = GridSignalGenerator(

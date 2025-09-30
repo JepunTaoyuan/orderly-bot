@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "mcp__deepwiki__read_wiki_contents",
+      "mcp__deepwiki__ask_question"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
