@@ -41,3 +41,4 @@ codebuff.json
 # Additional Python cache directories
 **/__pycache__/
 *.egg-info/
+.claude
