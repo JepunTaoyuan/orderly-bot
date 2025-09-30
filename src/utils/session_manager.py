@@ -24,11 +24,11 @@ class SessionManager:
     async def create_session(self, session_id: str, config: Dict[str, Any]) -> bool:
         """
         創建新的交易會話
-        
+
         Args:
             session_id: 會話ID
             config: 網格配置
-            
+
         Returns:
             是否創建成功
         """
@@ -36,29 +36,30 @@ class SessionManager:
             if session_id in self.sessions:
                 logger.warning(f"會話 {session_id} 已存在")
                 return False
-            
+
             try:
                 # 從數據庫獲取用戶憑證
                 user_id = config.get('user_id')
                 if not user_id:
                     raise ValueError("配置中缺少 user_id")
-                
-                user_data = self.mongo_manager.get_user(user_id)
+
+                user_data = await self.mongo_manager.get_user(user_id)
                 if not user_data:
                     raise ValueError(f"用戶 {user_id} 不存在")
                 
                 # 創建 GridTradingBot 實例，傳入用戶憑證
+                wallet_address = user_data.get('wallet_address') or user_data.get('evm_wallet_address')
                 bot = GridTradingBot(
-                    account_id=user_data.get('evm_wallet_address'),  # 使用錢包地址作為 account_id
+                    account_id=wallet_address,
                     orderly_key=user_data.get('api_key'),
                     orderly_secret=user_data.get('api_secret'),
                     orderly_testnet=True  # 可以從配置或環境變數獲取
                 )
-                
+
                 # 將用戶憑證添加到配置中，供 GridTradingBot 使用
                 enhanced_config = config.copy()
                 enhanced_config.update({
-                    'orderly_account_id': user_data.get('evm_wallet_address'),
+                    'orderly_account_id': wallet_address,
                     'orderly_key': user_data.get('api_key'),
                     'orderly_secret': user_data.get('api_secret'),
                     'orderly_testnet': True

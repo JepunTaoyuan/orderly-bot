@@ -266,17 +266,15 @@ class GridSignalGenerator:
                 "total_amount": str(self.total_amount),
             },
         )
-        print(f"每格投入: {self.amount_per_grid:.2f} USDT")
-        print(f"當前價格: {self.current_price}")
-        print(f"中心網格 index: {self.center_index}")
-        
+        logger.info(f"每格投入: {self.amount_per_grid:.2f} USDT")
+        logger.info(f"當前價格: {self.current_price}")
+        logger.info(f"中心網格 index: {self.center_index}")
+
         # 顯示停損價格
         if self.stop_bot_price:
             logger.info("設置下界停損", event_type="grid_stop_loss", data={"lower": str(self.stop_bot_price)})
         if self.stop_top_price:
             logger.info("設置上界停損", event_type="grid_stop_loss", data={"upper": str(self.stop_top_price)})
-        
-        print()
         
         if not self.is_active:
             logger.info("網格未激活，跳過設置")

@@ -22,8 +22,13 @@ from orderly_evm_connector.websocket.websocket_api import WebsocketPrivateAPICli
 logger = get_logger("grid_bot")
 
 class GridTradingBot:
+    # 常數定義
+    PROCESSED_FILLS_MAX_SIZE = 1000  # WebSocket 去重記錄最大數量
+    PROCESSED_FILLS_TTL = 300  # WebSocket 去重記錄 TTL（秒）
+    ORDER_CREATION_DELAY = 0.1  # 訂單創建之間的延遲（秒）
+
     def __init__(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
-        """初始化網格交易機器人"""  
+        """初始化網格交易機器人"""
         self.client = OrderlyClient(account_id = account_id, orderly_key = orderly_key, orderly_secret = orderly_secret, orderly_testnet = orderly_testnet)
         self.signal_generator = None
         self.active_orders = {}  # 記錄活躍訂單 {order_id: {"price": price, "side": side, "quantity": quantity}}
@@ -36,10 +41,11 @@ class GridTradingBot:
         self.market_info = None  # 當前市場信息
         self.order_tracker = OrderTracker()  # 訂單追踪器
         self.session_id = None  # 會話ID，用於生成唯一的 WebSocket ID
-        
-        # WebSocket 事件去重
-        self.processed_fills = set()  # 記錄已處理的成交ID
-        self.processed_fills_max_size = 1000  # 限制集合大小，防止記憶體洩漏
+
+        # WebSocket 事件去重（使用時間戳進行 TTL 管理）
+        self.processed_fills = {}  # {fill_id: timestamp}
+        self.processed_fills_max_size = self.PROCESSED_FILLS_MAX_SIZE
+        self.processed_fills_ttl = self.PROCESSED_FILLS_TTL
         
     def _convert_symbol(self, symbol: str) -> str:
         """
@@ -139,10 +145,31 @@ class GridTradingBot:
             logger.warning(f"設置 WebSocket 連接失敗: {e}")
             self.wss_client = None
     
+    def _cleanup_old_fills(self):
+        """清理過期的成交記錄（TTL 機制）"""
+        current_time = time.time()
+        expired_fills = [
+            fill_id for fill_id, timestamp in self.processed_fills.items()
+            if current_time - timestamp > self.processed_fills_ttl
+        ]
+
+        for fill_id in expired_fills:
+            del self.processed_fills[fill_id]
+
+        if expired_fills:
+            logger.debug(f"清理過期成交記錄: {len(expired_fills)} 個")
+
+        # 如果記錄仍然過多，清理最舊的一半
+        if len(self.processed_fills) > self.processed_fills_max_size:
+            sorted_fills = sorted(self.processed_fills.items(), key=lambda x: x[1])
+            for fill_id, _ in sorted_fills[:len(sorted_fills) // 2]:
+                del self.processed_fills[fill_id]
+            logger.warning(f"強制清理舊記錄，保留 {len(self.processed_fills)} 個")
+
     async def _handle_order_filled_event(self, fill_data: Dict[str, Any]):
         """
         處理 WebSocket 成交事件（帶去重機制）
-        
+
         Args:
             fill_data: 成交數據
         """
@@ -153,28 +180,25 @@ class GridTradingBot:
             executed_quantity = fill_data.get('executed_quantity')
             side = fill_data.get('side')
             fill_id = fill_data.get('fill_id')  # 成交唯一ID
-            
+
             # 檢查必要字段
             if not all([order_id, executed_price, executed_quantity, side]):
                 logger.warning(f"成交事件缺少必要字段: {fill_data}")
                 return
-            
+
             # WebSocket 事件去重檢查
             if fill_id:
                 if fill_id in self.processed_fills:
                     logger.debug(f"重複成交事件，跳過: fill_id={fill_id}")
                     return
-                
-                # 添加到已處理集合
-                self.processed_fills.add(fill_id)
-                
-                # 限制集合大小，防止記憶體洩漏
-                if len(self.processed_fills) > self.processed_fills_max_size:
-                    # 移除最舊的一半記錄
-                    old_fills = list(self.processed_fills)[:self.processed_fills_max_size // 2]
-                    for old_fill in old_fills:
-                        self.processed_fills.discard(old_fill)
-                    logger.debug(f"清理舊的成交記錄，保留 {len(self.processed_fills)} 個")
+
+                # 添加到已處理集合，記錄時間戳
+                current_time = time.time()
+                self.processed_fills[fill_id] = current_time
+
+                # 定期清理過期記錄
+                if len(self.processed_fills) % 100 == 0:
+                    self._cleanup_old_fills()
             
             # 處理成交事件
             await self._handle_order_filled(
@@ -294,7 +318,6 @@ class GridTradingBot:
                 price=price,
                 quantity=quantity
             )
-            await asyncio.sleep(0.1)
             
             # 事務性更新狀態
             async with self._orders_lock:
@@ -520,28 +543,29 @@ class GridTradingBot:
     async def _handle_stop_signal(self, symbol: str):
         """處理停止訊號"""
         logger.info(f"收到停止訊號，取消 {symbol} 的所有訂單")
-        
+
         try:
+            # 先停止機器人，防止新訂單被創建
+            self.is_running = False
+            logger.info("機器人已設置為停止狀態")
+
             # 取消所有相關訂單
             await self.client.cancel_all_orders(symbol)
-            
+
             # 清空活躍訂單記錄
             async with self._orders_lock:
                 self.active_orders.clear()
                 self.grid_orders.clear()
-            
+
             # 清空訂單追踪器
             self.order_tracker.clear()
-            
-            # 停止機器人
-            self.is_running = False
-            
+
             # 關閉 WebSocket 連接
             if self.wss_client:
                 self._safe_close_ws()
-            
+
             logger.info("停止訊號處理完成")
-            
+
         except Exception as e:
             logger.error(f"處理停止訊號失敗: {e}")
     

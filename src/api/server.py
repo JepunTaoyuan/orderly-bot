@@ -113,27 +113,27 @@ async def enable_bot_trading(config: RegisterConfig):
     """啟用機器人交易 儲存用戶資料進database"""
     try:
         # 檢查用戶是否已存在
-        if mongo_manager.get_user(config.user_id):
+        if await mongo_manager.get_user(config.user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_ALREADY_EXISTS,
                 details={"user_id": config.user_id}
             )
-        
+
         # 創建用戶
-        result = mongo_manager.create_user(
-            config.user_id, 
-            config.user_api_key, 
-            config.user_api_secret, 
+        result = await mongo_manager.create_user(
+            config.user_id,
+            config.user_api_key,
+            config.user_api_secret,
             config.user_wallet_address
         )
-        
+
         if not result.inserted_id:
             raise GridTradingException(
                 error_code=ErrorCode.USER_CREATION_FAILED,
                 details={"user_id": config.user_id}
             )
-            
-        return {"message": "success", "user_id": config.user_id}
+
+        return {"success": True, "data": {"user_id": config.user_id}}
         
     except GridTradingException:
         raise
@@ -161,30 +161,67 @@ class UpdateConfig(BaseModel):
     user_api_key: str
     user_api_secret: str
 
+@app.get("/api/user/check/{user_id}")
+async def check_user_exists(user_id: str):
+    """檢查用戶是否存在"""
+    try:
+        logger.info("檢查用戶是否存在", event_type="user_check", data={"user_id": user_id})
+
+        user = await mongo_manager.get_user(user_id)
+
+        if user:
+            return {
+                "success": True,
+                "data": {
+                    "exists": True,
+                    "user_id": user_id,
+                    "wallet_address": user.get("wallet_address")
+                }
+            }
+        else:
+            return {
+                "success": True,
+                "data": {
+                    "exists": False,
+                    "user_id": user_id
+                }
+            }
+
+    except Exception as e:
+        logger.error("檢查用戶失敗", event_type="user_check_error", data={
+            "user_id": user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"user_id": user_id},
+            original_error=e
+        )
+
 @app.put("/api/user/update")
 async def update_user_data(config: UpdateConfig):
     """更新機器人交易 儲存用戶資料進database"""
     try:
         # 檢查用戶是否存在
-        if not mongo_manager.get_user(config.user_id):
+        if not await mongo_manager.get_user(config.user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": config.user_id}
             )
-        
+
         # 更新用戶
-        result = mongo_manager.update_user(config.user_id, {
+        result = await mongo_manager.update_user(config.user_id, {
             "api_key": config.user_api_key,
             "api_secret": config.user_api_secret,
         })
-        
+
         if result.modified_count == 0 and result.matched_count == 0:
             raise GridTradingException(
                 error_code=ErrorCode.USER_UPDATE_FAILED,
                 details={"user_id": config.user_id}
             )
-            
-        return {"message": "success", "user_id": config.user_id}
+
+        return {"success": True, "data": {"user_id": config.user_id}}
         
     except GridTradingException:
         raise
@@ -212,10 +249,12 @@ class StartConfig(BaseModel):
             "stop_bot_price": 38000,
             "stop_top_price": 47000,
             "user_id": "user123",
-            "user_sig": "user123sig"
+            "user_sig": "user123sig",
+            "timestamp": 1234567890,
+            "nonce": "random_nonce"
         }
     })
-    
+
     ticker: str = Field(..., pattern=r"^[A-Z]+USDT$")
     direction: str = Field(..., pattern="^(LONG|SHORT|BOTH)$")
     current_price: float = Field(..., gt=0)
@@ -227,6 +266,8 @@ class StartConfig(BaseModel):
     stop_top_price: Optional[float] = Field(None, gt=0)
     user_id: str = Field(..., min_length=1)
     user_sig: str = Field(..., min_length=1)
+    timestamp: int = Field(..., gt=0)
+    nonce: str = Field(..., min_length=1)
 
     @model_validator(mode="after")
     def validate_bounds(self):
@@ -270,30 +311,41 @@ class StartConfig(BaseModel):
 @app.post("/api/grid/start")
 async def start_grid(config: StartConfig):
     # 檢查 user_id 是否存在
-    if not mongo_manager.get_user(config.user_id):
+    user_data = await mongo_manager.get_user(config.user_id)
+    if not user_data:
         raise GridTradingException(
             error_code=ErrorCode.USER_NOT_FOUND,
             details={"user_id": config.user_id}
         )
-    
+
     # 檢驗 user_sig
-    wallet_address = mongo_manager.get_user(config.user_id)['wallet_address']
+    wallet_address = user_data.get('wallet_address')
+    if not wallet_address:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SIGNATURE,
+            details={"user_id": config.user_id, "reason": "wallet_address not found"}
+        )
+
     wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
+    is_valid = False
+
     if wallet_type == 'evm':
-        if not wallet_verifier.verify_evm_signature(config.user_sig, wallet_address):
-            raise GridTradingException(
-                error_code=ErrorCode.INVALID_SIGNATURE,
-                details={"user_id": config.user_id, "wallet_type": wallet_type}
-            )
+        is_valid = wallet_verifier.verify_evm_signature(
+            config.user_sig, wallet_address, config.timestamp, config.nonce
+        )
     elif wallet_type == 'solana':
-        if not wallet_verifier.verify_solana_signature(config.user_sig, wallet_address):
-            raise GridTradingException(
-                error_code=ErrorCode.INVALID_SIGNATURE,
-                details={"user_id": config.user_id, "wallet_type": wallet_type}
-            )
+        is_valid = wallet_verifier.verify_solana_signature(
+            config.user_sig, wallet_address, config.timestamp, config.nonce
+        )
     else:
         raise GridTradingException(
             error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
+            details={"user_id": config.user_id, "wallet_type": wallet_type}
+        )
+
+    if not is_valid:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SIGNATURE,
             details={"user_id": config.user_id, "wallet_type": wallet_type}
         )
 
@@ -306,15 +358,14 @@ async def start_grid(config: StartConfig):
                 "ticker": config.ticker,
                 "direction": config.direction
             })
-            
             metrics.increment_counter("api.grid.start.requests", tags={"ticker": config.ticker})
-            
+
             success = await session_manager.create_session(session_id, config.to_internal())
-            
+
             if success:
                 metrics.increment_counter("api.grid.start.success", tags={"ticker": config.ticker})
                 logger.info("網格交易啟動成功", event_type="grid_started", data={"session_id": session_id})
-                return {"status": "started", "session_id": session_id}
+                return {"success": True, "data": {"status": "started", "session_id": session_id}}
             else:
                 # 會話已存在的情況
                 raise GridTradingException(
@@ -349,36 +400,65 @@ class StopConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "session_id": "user123_BTCUSDT",
-            "user_sig": "user123"
+            "user_sig": "user123",
+            "timestamp": 1234567890,
+            "nonce": "random_nonce"
         }
     })
-    
+
     session_id: str = Field(..., min_length=1)
     user_sig: str = Field(..., min_length=1)
+    timestamp: int = Field(..., gt=0)
+    nonce: str = Field(..., min_length=1)
 
 @app.post("/api/grid/stop")
 async def stop_grid(config: StopConfig):
     session_id = validate_session_id(config.session_id)
-    
+
+    # 解析 user_id
+    parts = session_id.split('_')
+    if len(parts) < 2:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SESSION_ID,
+            details={"session_id": session_id}
+        )
+    user_id = parts[-2]
+
     # 檢驗 user_sig
-    user_id = session_id.split('_')[-2]
-    wallet_address = mongo_manager.get_user(user_id)['wallet_address']
+    user_data = await mongo_manager.get_user(user_id)
+    if not user_data:
+        raise GridTradingException(
+            error_code=ErrorCode.USER_NOT_FOUND,
+            details={"user_id": user_id}
+        )
+
+    wallet_address = user_data.get('wallet_address')
+    if not wallet_address:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SIGNATURE,
+            details={"user_id": user_id, "reason": "wallet_address not found"}
+        )
+
     wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
+    is_valid = False
+
     if wallet_type == 'evm':
-        if not wallet_verifier.verify_evm_signature(config.user_sig, wallet_address):
-            raise GridTradingException(
-                error_code=ErrorCode.INVALID_SIGNATURE,
-                details={"user_id": user_id, "wallet_type": wallet_type}
-            )
+        is_valid = wallet_verifier.verify_evm_signature(
+            config.user_sig, wallet_address, config.timestamp, config.nonce
+        )
     elif wallet_type == 'solana':
-        if not wallet_verifier.verify_solana_signature(config.user_sig, wallet_address):
-            raise GridTradingException(
-                error_code=ErrorCode.INVALID_SIGNATURE,
-                details={"user_id": user_id, "wallet_type": wallet_type}
-            )
+        is_valid = wallet_verifier.verify_solana_signature(
+            config.user_sig, wallet_address, config.timestamp, config.nonce
+        )
     else:
         raise GridTradingException(
             error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
+            details={"user_id": user_id, "wallet_type": wallet_type}
+        )
+
+    if not is_valid:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SIGNATURE,
             details={"user_id": user_id, "wallet_type": wallet_type}
         )
 
@@ -392,7 +472,7 @@ async def stop_grid(config: StopConfig):
             if success:
                 metrics.increment_counter("api.grid.stop.success")
                 logger.info("網格交易停止成功", event_type="grid_stopped", data={"session_id": session_id})
-                return {"status": "stopped", "session_id": session_id}
+                return {"success": True, "data": {"status": "stopped", "session_id": session_id}}
             else:
                 # 會話不存在的情況
                 raise GridTradingException(
@@ -421,7 +501,7 @@ async def get_status(session_id: str):
     try:
         status = await session_manager.get_session_status(session_id)
         if status is not None:
-            return status
+            return {"success": True, "data": status}
         else:
             raise GridTradingException(
                 error_code=ErrorCode.SESSION_NOT_FOUND,
@@ -444,7 +524,7 @@ async def get_status(session_id: str):
 async def list_sessions():
     try:
         sessions = await session_manager.list_sessions()
-        return {"sessions": sessions}
+        return {"success": True, "data": {"sessions": sessions}}
     except Exception as e:
         logger.error("列出會話失敗", event_type="list_sessions_error", data={"error": str(e)})
         raise GridTradingException(
@@ -481,9 +561,18 @@ async def readiness_check():
             original_error=e
         )
 
+# 常數定義
+DEFAULT_METRICS_LIMIT_COUNTERS = 10
+DEFAULT_METRICS_LIMIT_GAUGES = 5
+DEFAULT_METRICS_LIMIT_HISTOGRAMS = 3
+
 @app.get("/metrics")
-async def get_metrics(limit_counters: int = 10, limit_gauges: int = 5, limit_histograms: int = 3):
-    """獲取系統指標（可限制每類返回數量，預設 counters:10, gauges:5, histograms:3）"""
+async def get_metrics(
+    limit_counters: int = DEFAULT_METRICS_LIMIT_COUNTERS,
+    limit_gauges: int = DEFAULT_METRICS_LIMIT_GAUGES,
+    limit_histograms: int = DEFAULT_METRICS_LIMIT_HISTOGRAMS
+):
+    """獲取系統指標（可限制每類返回數量）"""
     try:
         data = metrics.get_metrics()
 
@@ -504,6 +593,23 @@ async def get_metrics(limit_counters: int = 10, limit_gauges: int = 5, limit_his
     except Exception as e:
         logger.error("獲取指標失敗", event_type="metrics", data={"error": str(e)})
         raise HTTPException(status_code=500, detail=f"failed_to_get_metrics: {e}")
+
+@app.get("/api/auth/challenge")
+async def get_challenge():
+    """生成簽名挑戰"""
+    try:
+        challenge = wallet_verifier.generate_challenge()
+        return {
+            "success": True,
+            "data": challenge
+        }
+    except Exception as e:
+        logger.error("生成挑戰失敗", event_type="challenge_error", data={"error": str(e)})
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"reason": "challenge generation failed"},
+            original_error=e
+        )
 
 @app.get("/")
 async def root():
