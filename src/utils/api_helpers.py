@@ -82,7 +82,6 @@ def with_orderly_api_handling(operation_name: str):
             
             async def _api_call():
                 response = await func(self, *args, **kwargs)
-                await asyncio.sleep(0.1)  # 避免過快請求
                 return response
             
             try:
