@@ -135,9 +135,6 @@ open http://localhost:8000/docs
 
 ### 必要環境變數
 ```bash
-ORDERLY_KEY=ed25519:your_private_key        # Orderly 私鑰（僅用於系統管理）
-ORDERLY_SECRET=ed25519:your_secret_key      # Orderly 密鑰（僅用於系統管理）
-ORDERLY_ACCOUNT_ID=0x...                    # Orderly 帳戶 ID（僅用於系統管理）
 MONGODB_URI=mongodb://...                   # MongoDB 連接字符串
 ```
 

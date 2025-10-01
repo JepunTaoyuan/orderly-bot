@@ -440,6 +440,10 @@ class GridTradingBot:
                 # 處理停止訊號
                 await self._handle_stop_signal(orderly_symbol)
                 
+            elif signal.signal_type == "MARKET_OPEN":
+                # 處理市價開倉訊號
+                await self._handle_market_open_signal(signal, orderly_symbol, orderly_side)
+                
             elif signal.signal_type == "INITIAL":
                 # 處理初始網格訊號
                 await self._handle_initial_signal(signal, orderly_symbol, orderly_side)
@@ -454,6 +458,49 @@ class GridTradingBot:
                 
         except Exception as e:
             logger.error(f"處理訊號失敗: {e}")
+    
+    async def _handle_market_open_signal(self, signal: TradingSignal, symbol: str, side: str):
+        """處理市價開倉訊號（做多/做空初始倉位）"""
+        try:
+            logger.info(f"執行市價開倉: {side} @ 市價, 數量={signal.size}")
+            
+            # 驗證訂單大小
+            size = signal.size
+            if self.market_info:
+                try:
+                    # 市價單只需要驗證數量
+                    _, norm_size = self.validator.validate_order(
+                        self.market_info.symbol, 
+                        signal.price,  # 市價單價格僅用於參考
+                        signal.size
+                    )
+                    size = norm_size
+                except ValidationError as e:
+                    logger.error(f"市價開倉訂單驗證失敗: {e}")
+                    return
+            
+            # 創建市價訂單
+            response = await self.client.create_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=float(size)
+            )
+            
+            # 記錄訂單（市價單不需要加入網格追踪）
+            if response.get('success', True):
+                order_id = response.get('data', {}).get('order_id')
+                if order_id:
+                    logger.info(f"市價開倉成功: ID={order_id}, 方向={side}, 數量={size}")
+                    metrics.increment_counter("orders.market_open", tags={"side": side})
+                else:
+                    logger.error(f"市價開倉響應中缺少 order_id: {response}")
+            else:
+                logger.error(f"市價開倉失敗: {response}")
+                metrics.increment_counter("orders.market_open.errors", tags={"side": side})
+            
+        except Exception as e:
+            logger.error(f"執行市價開倉失敗: {e}")
+            metrics.increment_counter("orders.market_open.errors", tags={"side": side})
     
     async def _handle_initial_signal(self, signal: TradingSignal, symbol: str, side: str):
         """處理初始網格訊號"""
