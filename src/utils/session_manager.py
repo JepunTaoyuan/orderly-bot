@@ -58,7 +58,7 @@ class SessionManager:
                 # 創建 GridTradingBot 實例，傳入用戶憑證
                 wallet_address = user_data.get('wallet_address') or user_data.get('evm_wallet_address')
                 bot = GridTradingBot(
-                    account_id=wallet_address,
+                    account_id=user_id,
                     orderly_key=user_data.get('api_key'),
                     orderly_secret=user_data.get('api_secret'),
                     orderly_testnet=True  # 可以從配置或環境變數獲取
@@ -67,7 +67,7 @@ class SessionManager:
                 # 將用戶憑證添加到配置中，供 GridTradingBot 使用
                 enhanced_config = config.copy()
                 enhanced_config.update({
-                    'orderly_account_id': wallet_address,
+                    'orderly_account_id': user_id,
                     'orderly_key': user_data.get('api_key'),
                     'orderly_secret': user_data.get('api_secret'),
                     'orderly_testnet': True
