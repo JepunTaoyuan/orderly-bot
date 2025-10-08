@@ -31,6 +31,9 @@ from src.utils.api_helpers import SessionContextManager, validate_session_id, cr
 from src.utils.mongo_manager import MongoManager
 from fastapi.middleware.cors import CORSMiddleware
 from src.utils.wallet_sig_verify import WalletSignatureVerifier
+from src.utils.slowapi_limiter import get_slowapi_rate_limiter, limiter, RATE_LIMITS
+from slowapi.errors import RateLimitExceeded
+from src.utils.slowapi_dependencies import auto_rate_limit
 
 
 load_dotenv()
@@ -59,6 +62,35 @@ session_manager = SessionManager()
 # 全域MongoDB管理器
 mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
 
+@app.on_event("startup")
+async def startup_event():
+    """應用啟動時的初始化"""
+    try:
+        # 初始化錢包驗證器的數據庫連接
+        if hasattr(mongo_manager, 'db'):
+            wallet_verifier.initialize_with_database(mongo_manager.db)
+            await wallet_verifier.ensure_indexes()
+            logger.info("錢包驗證器初始化完成")
+        else:
+            logger.warning("MongoDB 連接未正確初始化，錢包驗證器將使用內存模式")
+
+        # 初始化速率限制器（SlowAPI）
+        slowapi_limiter = get_slowapi_rate_limiter()
+        logger.info("SlowAPI 速率限制器初始化完成")
+
+        # 記錄速率限制配置
+        logger.info("速率限制配置", data={
+            "global_limit": RATE_LIMITS['global'],
+            "per_user_limit": RATE_LIMITS['per_user'],
+            "auth_limit": RATE_LIMITS['auth'],
+            "trading_limit": RATE_LIMITS['trading'],
+            "grid_control_limit": RATE_LIMITS['grid_control']
+        })
+
+    except Exception as e:
+        logger.error(f"安全組件初始化失敗: {e}")
+        # 初始化失敗不應該阻止應用啟動
+
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
 async def grid_trading_exception_handler(request: Request, exc: GridTradingException):
@@ -73,6 +105,31 @@ async def grid_trading_exception_handler(request: Request, exc: GridTradingExcep
     return JSONResponse(
         status_code=exc.get_http_status(),
         content=exc.to_dict()
+    )
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exception_handler(request: Request, exc: RateLimitExceeded):
+    """處理速率限制超出錯誤"""
+    slowapi_limiter = get_slowapi_rate_limiter()
+
+    # 使用自定義錯誤處理器
+    if hasattr(slowapi_limiter, 'custom_error_handler'):
+        return await slowapi_limiter.custom_error_handler(request, exc)
+
+    # 默認處理
+    logger.warning(f"速率限制觸發: {exc.detail}", data={
+        "path": request.url.path,
+        "method": request.method,
+        "ip": request.client.host if request.client else "unknown"
+    })
+
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "message": str(exc.detail),
+            "retry_after": 60
+        }
     )
 
 @app.exception_handler(ValidationError)
@@ -109,7 +166,8 @@ class RegisterConfig(BaseModel):
     user_wallet_address: str
 
 @app.post("/api/user/enable")
-async def enable_bot_trading(config: RegisterConfig):
+@limiter.limit(RATE_LIMITS['auth'])
+async def enable_bot_trading(request: Request, config: RegisterConfig):
     """啟用機器人交易 儲存用戶資料進database"""
     try:
         # 檢查用戶是否已存在
@@ -309,7 +367,8 @@ class StartConfig(BaseModel):
 
 
 @app.post("/api/grid/start")
-async def start_grid(config: StartConfig):
+@limiter.limit(RATE_LIMITS['grid_control'])
+async def start_grid(request: Request, config: StartConfig):
     # 檢查 user_id 是否存在
     user_data = await mongo_manager.get_user(config.user_id)
     if not user_data:
@@ -330,11 +389,11 @@ async def start_grid(config: StartConfig):
     is_valid = False
 
     if wallet_type == 'evm':
-        is_valid = wallet_verifier.verify_evm_signature(
+        is_valid = await wallet_verifier.verify_evm_signature(
             config.user_sig, wallet_address, config.timestamp, config.nonce
         )
     elif wallet_type == 'solana':
-        is_valid = wallet_verifier.verify_solana_signature(
+        is_valid = await wallet_verifier.verify_solana_signature(
             config.user_sig, wallet_address, config.timestamp, config.nonce
         )
     else:
@@ -412,7 +471,8 @@ class StopConfig(BaseModel):
     nonce: str = Field(..., min_length=1)
 
 @app.post("/api/grid/stop")
-async def stop_grid(config: StopConfig):
+@limiter.limit(RATE_LIMITS['grid_control'])
+async def stop_grid(request: Request, config: StopConfig):
     session_id = validate_session_id(config.session_id)
 
     # 解析 user_id
@@ -443,11 +503,11 @@ async def stop_grid(config: StopConfig):
     is_valid = False
 
     if wallet_type == 'evm':
-        is_valid = wallet_verifier.verify_evm_signature(
+        is_valid = await wallet_verifier.verify_evm_signature(
             config.user_sig, wallet_address, config.timestamp, config.nonce
         )
     elif wallet_type == 'solana':
-        is_valid = wallet_verifier.verify_solana_signature(
+        is_valid = await wallet_verifier.verify_solana_signature(
             config.user_sig, wallet_address, config.timestamp, config.nonce
         )
     else:
@@ -497,7 +557,8 @@ async def stop_grid(config: StopConfig):
 
 
 @app.get("/api/grid/status/{session_id}")
-async def get_status(session_id: str):
+@limiter.limit(RATE_LIMITS['status_check'])
+async def get_status(request: Request, session_id: str):
     try:
         status = await session_manager.get_session_status(session_id)
         if status is not None:
@@ -595,7 +656,8 @@ async def get_metrics(
         raise HTTPException(status_code=500, detail=f"failed_to_get_metrics: {e}")
 
 @app.get("/api/auth/challenge")
-async def get_challenge():
+@limiter.limit(RATE_LIMITS['auth'])
+async def get_challenge(request: Request):
     """生成簽名挑戰"""
     try:
         challenge = wallet_verifier.generate_challenge()

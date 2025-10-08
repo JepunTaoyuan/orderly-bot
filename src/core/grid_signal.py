@@ -97,7 +97,8 @@ class GridSignalGenerator:
         if self.direction in [Direction.LONG, Direction.SHORT]:
             self.initial_position_amount = self.total_amount / Decimal('2')  # 50% 開初始倉位
             self.grid_total_amount = self.total_amount / Decimal('2')  # 50% 分配到網格
-            self.amount_per_grid = self.grid_total_amount / Decimal(str(grid_levels))
+            self.amount_per_grid_above = self.grid_total_amount / Decimal(str(self.grid_levels_above))
+            self.amount_per_grid_below = self.grid_total_amount / Decimal(str(self.grid_levels_below))
         else:
             # 雙向策略：全部資金分配到網格
             self.initial_position_amount = Decimal('0')
@@ -139,7 +140,7 @@ class GridSignalGenerator:
                 closest_index = i
         return closest_index
     
-    def _calculate_position_size(self, price: Decimal) -> Decimal:
+    def _calculate_position_size(self, price: Decimal, type: Direction) -> Decimal:
         """根據價格和每格金額計算倉位大小"""
         return (self.amount_per_grid / price).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
     

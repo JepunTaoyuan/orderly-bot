@@ -116,8 +116,8 @@ class MarketValidator:
         if not ticker:
             raise ValidationError("缺少ticker")
         
-        # 轉換符號
-        orderly_symbol = self._convert_symbol(ticker)
+        # 前端已保證傳入 PERP_* 正確格式，直接使用
+        orderly_symbol = ticker
         market_info = self.get_market_info(orderly_symbol)
         
         if not market_info:
@@ -251,29 +251,4 @@ class MarketValidator:
         
         return norm_price, norm_quantity
     
-    def _convert_symbol(self, symbol: str) -> str:
-        """
-        轉換符號格式
-
-        Args:
-            symbol: 原始符號 (如 BTCUSDT)
-
-        Returns:
-            Orderly格式符號 (如 PERP_BTC_USDC)
-        """
-        symbol_map = {
-            "BTCUSDT": "PERP_BTC_USDC",
-            "ETHUSDT": "PERP_ETH_USDC",
-            "SOLUSDT": "PERP_SOL_USDC",
-            "NEARUSDT": "PERP_NEAR_USDC",
-            "ARBUSDT": "PERP_ARB_USDC",
-            "OPUSDT": "PERP_OP_USDC",
-            "BTCUSDC": "PERP_BTC_USDC",
-            "ETHUSDC": "PERP_ETH_USDC",
-            "SOLUSDC": "PERP_SOL_USDC",
-            "NEARUSDC": "PERP_NEAR_USDC",
-            "ARBUSDC": "PERP_ARB_USDC",
-            "OPUSDC": "PERP_OP_USDC",
-        }
-
-        return symbol_map.get(symbol.upper(), symbol)
+    # 已移除符號轉換，統一要求外部傳入 PERP_* 形式

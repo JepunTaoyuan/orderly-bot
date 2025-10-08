@@ -19,11 +19,50 @@ class WalletSignatureVerifier:
 
     def __init__(self):
         """
-        初始化錢包簽名驗證器
+        初始化錢包簽名驗證器 - 使用 MongoDB 持久化存儲防止重放攻擊
         """
-        # 存儲已使用的 nonce，防止重放攻擊
-        self._used_nonces = {}  # {nonce: timestamp}
-        self._max_nonces = 10000
+        # 將在初始化時設置 MongoDB 連接
+        self.nonces_collection = None
+
+    def initialize_with_database(self, database):
+        """
+        使用數據庫連接初始化驗證器
+
+        Args:
+            database: MongoDB 數據庫對象
+        """
+        self.nonces_collection = database.get_collection("used_nonces")
+        logger.info("錢包驗證器已初始化 MongoDB 連接")
+
+    async def ensure_indexes(self):
+        """
+        確保創建必要的索引
+        - nonce 唯一索引
+        - expires_at 索引用於查詢優化
+        """
+        if self.nonces_collection is None:
+            logger.warning("MongoDB 連接未初始化，跳過索引創建")
+            return
+
+        try:
+            # nonce 唯一索引（防止重複）
+            await self.nonces_collection.create_index(
+                "nonce",
+                unique=True,
+                background=True
+            )
+
+            # expires_at 索引用於自動清理查詢
+            await self.nonces_collection.create_index(
+                "expires_at",
+                background=True
+            )
+
+            logger.info("Nonce 索引創建成功")
+
+        except Exception as e:
+            logger.error(f"創建索引失敗: {e}")
+            # 索引創建失敗不應該阻止應用啟動
 
     def _generate_message(self, timestamp: int, nonce: str) -> str:
         """
@@ -38,25 +77,27 @@ class WalletSignatureVerifier:
         """
         return f"Please sign this message to confirm your identity.\nTimestamp: {timestamp}\nNonce: {nonce}"
 
-    def _cleanup_old_nonces(self):
-        """清理過期的 nonce 記錄"""
-        current_time = int(time.time())
-        expired_nonces = [
-            nonce for nonce, ts in self._used_nonces.items()
-            if current_time - ts > self.SIGNATURE_VALIDITY_WINDOW
-        ]
-        for nonce in expired_nonces:
-            del self._used_nonces[nonce]
+    async def cleanup_expired_nonces(self):
+        """清理過期的 nonce 記錄（持久化清理）"""
+        if self.nonces_collection is None:
+            logger.warning("MongoDB 連接未初始化，跳過清理操作")
+            return
 
-        # 如果記錄過多，清理最舊的一半
-        if len(self._used_nonces) > self._max_nonces:
-            sorted_nonces = sorted(self._used_nonces.items(), key=lambda x: x[1])
-            for nonce, _ in sorted_nonces[:len(sorted_nonces) // 2]:
-                del self._used_nonces[nonce]
+        try:
+            current_time = int(time.time())
+            result = await self.nonces_collection.delete_many({
+                "expires_at": {"$lt": current_time}
+            })
 
-    def _validate_timestamp_and_nonce(self, timestamp: int, nonce: str) -> bool:
+            if result.deleted_count > 0:
+                logger.debug(f"清理了 {result.deleted_count} 個過期 nonce")
+
+        except Exception as e:
+            logger.error(f"清理過期 nonce 失敗: {e}")
+
+    async def validate_timestamp_and_nonce(self, timestamp: int, nonce: str) -> bool:
         """
-        驗證時間戳和 nonce
+        驗證時間戳和 nonce - 使用 MongoDB 持久化存儲防止重放攻擊
 
         Args:
             timestamp: 簽名時的時間戳
@@ -65,6 +106,10 @@ class WalletSignatureVerifier:
         Returns:
             是否有效
         """
+        if self.nonces_collection is None:
+            logger.warning("MongoDB 連接未初始化，為安全起見拒絕請求")
+            return False
+
         current_time = int(time.time())
 
         # 檢查時間窗口
@@ -72,19 +117,45 @@ class WalletSignatureVerifier:
             logger.warning(f"簽名已過期: timestamp={timestamp}, current={current_time}")
             return False
 
-        # 檢查 nonce 是否已使用
-        if nonce in self._used_nonces:
-            logger.warning(f"Nonce 已被使用: {nonce}")
+        try:
+            # 檢查 nonce 是否已使用（持久化檢查）
+            existing = await self.nonces_collection.find_one({"nonce": nonce})
+            if existing:
+                logger.warning(
+                    f"Nonce 重複使用檢測: {nonce}",
+                    event_type="security.replay_attempt",
+                    data={
+                        "nonce": nonce[:10] + "...",  # 只記錄部分 nonce 保護隱私
+                        "existing_timestamp": existing.get("timestamp"),
+                        "attempt_timestamp": timestamp
+                    }
+                )
+                return False
+
+            # 記錄 nonce 使用（持久化存儲）
+            expires_at = timestamp + self.SIGNATURE_VALIDITY_WINDOW
+            await self.nonces_collection.insert_one({
+                "nonce": nonce,
+                "timestamp": timestamp,
+                "expires_at": expires_at,
+                "created_at": current_time
+            })
+
+            logger.debug(
+                f"Nonce 記錄成功: {nonce[:10]}...",
+                event_type="security.nonce_recorded",
+                data={
+                    "nonce": nonce[:10] + "...",
+                    "expires_at": expires_at
+                }
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Nonce 驗證失敗: {e}")
+            # 如果數據庫操作失敗，為安全起見拒絕請求
             return False
-
-        # 記錄 nonce
-        self._used_nonces[nonce] = timestamp
-
-        # 定期清理
-        if len(self._used_nonces) % 100 == 0:
-            self._cleanup_old_nonces()
-
-        return True
 
     def detect_wallet_type(self, address: str) -> str:
         """
@@ -103,7 +174,7 @@ class WalletSignatureVerifier:
         # 其他都是solana
             return 'solana'
     
-    def verify_evm_signature(self, signature: str, address: str, timestamp: int, nonce: str) -> bool:
+    async def verify_evm_signature(self, signature: str, address: str, timestamp: int, nonce: str) -> bool:
         """
         驗證 EVM (Ethereum) 錢包簽名
 
@@ -117,8 +188,8 @@ class WalletSignatureVerifier:
             bool: 簽名是否有效
         """
         try:
-            # 驗證時間戳和 nonce
-            if not self._validate_timestamp_and_nonce(timestamp, nonce):
+            # 驗證時間戳和 nonce（異步持久化檢查）
+            if not await self.validate_timestamp_and_nonce(timestamp, nonce):
                 return False
 
             # 生成驗證訊息
@@ -147,7 +218,7 @@ class WalletSignatureVerifier:
             logger.error(f"EVM簽名驗證異常: {e}")
             return False
     
-    def verify_solana_signature(self, signature: str, public_key: str, timestamp: int, nonce: str) -> bool:
+    async def verify_solana_signature(self, signature: str, public_key: str, timestamp: int, nonce: str) -> bool:
         """
         驗證 Solana 錢包簽名
 
@@ -161,8 +232,8 @@ class WalletSignatureVerifier:
             bool: 簽名是否有效
         """
         try:
-            # 驗證時間戳和 nonce
-            if not self._validate_timestamp_and_nonce(timestamp, nonce):
+            # 驗證時間戳和 nonce（異步持久化檢查）
+            if not await self.validate_timestamp_and_nonce(timestamp, nonce):
                 return False
 
             # 生成驗證訊息
@@ -207,9 +278,9 @@ class WalletSignatureVerifier:
             logger.error(f"Solana簽名驗證異常: {e}")
             return False
     
-    def verify_signature(self, signature: str, address: str, timestamp: int, nonce: str) -> dict:
+    async def verify_signature(self, signature: str, address: str, timestamp: int, nonce: str) -> dict:
         """
-        驗證錢包簽名
+        驗證錢包簽名 - 使用安全的持久化 nonce 驗證
 
         Args:
             signature: 簽名
@@ -235,12 +306,12 @@ class WalletSignatureVerifier:
             logger.warning(f"無法識別的錢包地址: {address}")
             return result
 
-        # 驗證簽名
+        # 驗證簽名（異步）
         if wallet_type == 'evm':
-            result['signature_valid'] = self.verify_evm_signature(signature, address, timestamp, nonce)
+            result['signature_valid'] = await self.verify_evm_signature(signature, address, timestamp, nonce)
             result['message'] = 'EVM錢包驗證完成'
         elif wallet_type == 'solana':
-            result['signature_valid'] = self.verify_solana_signature(signature, address, timestamp, nonce)
+            result['signature_valid'] = await self.verify_solana_signature(signature, address, timestamp, nonce)
             result['message'] = 'Solana錢包驗證完成'
 
         return result

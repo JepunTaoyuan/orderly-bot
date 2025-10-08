@@ -47,35 +47,6 @@ class GridTradingBot:
         self.processed_fills_max_size = self.PROCESSED_FILLS_MAX_SIZE
         self.processed_fills_ttl = self.PROCESSED_FILLS_TTL
         
-    def _convert_symbol(self, symbol: str) -> str:
-        """
-        將訊號生成器的符號轉換為 Orderly 格式
-        例如: BTCUSDT -> PERP_BTC_USDC
-        """
-        # 標準化符號格式（移除可能的 USDC 後綴）
-        symbol_upper = symbol.upper().replace("USDC", "").replace("USDT", "")
-
-        # 符號映射表（與 market_validator.py 保持一致）
-        symbol_map = {
-            "BTC": "PERP_BTC_USDC",
-            "ETH": "PERP_ETH_USDC",
-            "SOL": "PERP_SOL_USDC",
-            "NEAR": "PERP_NEAR_USDC",
-            "ARB": "PERP_ARB_USDC",
-            "OP": "PERP_OP_USDC",
-        }
-
-        # 如果已經是 Orderly 格式（以 PERP_ 開頭），直接返回
-        if symbol.startswith("PERP_"):
-            return symbol
-
-        # 嘗試映射
-        if symbol_upper in symbol_map:
-            return symbol_map[symbol_upper]
-
-        # 如果找不到映射，記錄警告並返回原始值
-        logger.warning(f"無法轉換交易對符號: {symbol}，使用原始值")
-        return symbol
     
     def _convert_side(self, side: OrderSide) -> str:
         """將訊號生成器的方向轉換為 Orderly 格式"""
@@ -433,7 +404,8 @@ class GridTradingBot:
                 logger.warning("機器人未運行，忽略訊號")
                 return
             
-            orderly_symbol = self._convert_symbol(signal.symbol)
+            # 前端已保證傳入 PERP_* 形式，直接使用原符號
+            orderly_symbol = signal.symbol
             orderly_side = self._convert_side(signal.side)
             
             if signal.signal_type == "STOP":
