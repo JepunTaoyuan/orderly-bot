@@ -584,7 +584,7 @@ async def get_status(request: Request, session_id: str):
 
 @app.get("/api/grid/sessions")
 @limiter.limit(RATE_LIMITS['status_check'])
-async def list_sessions():
+async def list_sessions(request: Request):
     try:
         sessions = await session_manager.list_sessions()
         return {"success": True, "data": {"sessions": sessions}}
