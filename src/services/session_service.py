@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from src.core.grid_bot import GridTradingBot
-from src.utils.mongo_manager import MongoManager
+from src.services.database_service import MongoManager
 import os
 
 logger = logging.getLogger(__name__)

@@ -24,14 +24,16 @@ from pydantic import model_validator
 from contextlib import asynccontextmanager
 
 from src.core.grid_signal import Direction
-from src.utils.session_manager import SessionManager
+from src.services.session_service import SessionManager
 from src.utils.logging_config import configure_logging, get_logger, metrics, set_session_context
 from src.utils.error_codes import GridTradingException, ErrorCode
 from src.utils.market_validator import ValidationError
 from src.utils.api_helpers import SessionContextManager, validate_session_id, create_session_id
-from src.utils.mongo_manager import MongoManager
+from src.services.database_service import MongoManager
 from fastapi.middleware.cors import CORSMiddleware
-from src.utils.wallet_sig_verify import WalletSignatureVerifier
+from src.auth.wallet_signature import WalletSignatureVerifier
+from src.auth.auth_decorators import init_auth_dependencies, WalletAuthContext
+from src.utils.resilient_handler import api_retry
 from src.utils.slowapi_limiter import get_slowapi_rate_limiter, limiter, RATE_LIMITS
 from slowapi.errors import RateLimitExceeded
 from src.utils.slowapi_dependencies import auto_rate_limit
@@ -43,26 +45,6 @@ load_dotenv()
 configure_logging(level="INFO", format_json=True)
 logger = get_logger("main")
 
-app = FastAPI(title="Grid Trading Server", version="1.0.0")
-
-# 錢包簽名驗證器
-wallet_verifier = WalletSignatureVerifier()
-
-#For test
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 全域會話管理器
-session_manager = SessionManager()
-
-# 全域MongoDB管理器
-mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """應用啟動時的初始化"""
@@ -71,6 +53,9 @@ async def lifespan(app: FastAPI):
         if hasattr(mongo_manager, 'db'):
             wallet_verifier.initialize_with_database(mongo_manager.db)
             await wallet_verifier.ensure_indexes()
+
+            # 初始化認證依賴
+            init_auth_dependencies(mongo_manager, wallet_verifier)
             logger.info("錢包驗證器初始化完成")
         else:
             logger.warning("MongoDB 連接未正確初始化，錢包驗證器將使用內存模式")
@@ -91,6 +76,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"安全組件初始化失敗: {e}")
         # 初始化失敗不應該阻止應用啟動
+
+app = FastAPI(title="Grid Trading Server", version="1.0.0", lifespan=lifespan)
+
+# 錢包簽名驗證器
+wallet_verifier = WalletSignatureVerifier()
+
+#For test
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 全域會話管理器
+session_manager = SessionManager()
+
+# 全域MongoDB管理器
+mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
 
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
@@ -168,6 +173,7 @@ class RegisterConfig(BaseModel):
 
 @app.post("/api/user/enable")
 @limiter.limit(RATE_LIMITS['auth'])
+@api_retry
 async def enable_bot_trading(request: Request, config: RegisterConfig):
     """啟用機器人交易 儲存用戶資料進database"""
     try:
@@ -258,6 +264,7 @@ async def check_user_exists(user_id: str):
         )
 
 @app.put("/api/user/update")
+@api_retry
 async def update_user_data(config: UpdateConfig):
     """更新機器人交易 儲存用戶資料進database"""
     try:
@@ -369,45 +376,17 @@ class StartConfig(BaseModel):
 
 @app.post("/api/grid/start")
 @limiter.limit(RATE_LIMITS['grid_control'])
+@api_retry
 async def start_grid(request: Request, config: StartConfig):
-    # 檢查 user_id 是否存在
-    user_data = await mongo_manager.get_user(config.user_id)
-    if not user_data:
-        raise GridTradingException(
-            error_code=ErrorCode.USER_NOT_FOUND,
-            details={"user_id": config.user_id}
-        )
-
-    # 檢驗 user_sig
-    wallet_address = user_data.get('wallet_address')
-    if not wallet_address:
-        raise GridTradingException(
-            error_code=ErrorCode.INVALID_SIGNATURE,
-            details={"user_id": config.user_id, "reason": "wallet_address not found"}
-        )
-
-    wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
-    is_valid = False
-
-    if wallet_type == 'evm':
-        is_valid = await wallet_verifier.verify_evm_signature(
-            config.user_sig, wallet_address, config.timestamp, config.nonce
-        )
-    elif wallet_type == 'solana':
-        is_valid = await wallet_verifier.verify_solana_signature(
-            config.user_sig, wallet_address, config.timestamp, config.nonce
-        )
-    else:
-        raise GridTradingException(
-            error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
-            details={"user_id": config.user_id, "wallet_type": wallet_type}
-        )
-
-    if not is_valid:
-        raise GridTradingException(
-            error_code=ErrorCode.INVALID_SIGNATURE,
-            details={"user_id": config.user_id, "wallet_type": wallet_type}
-        )
+    # 使用統一的簽名驗證
+    async with WalletAuthContext(
+        config.user_id,
+        config.user_sig,
+        config.timestamp,
+        config.nonce
+    ) as auth_result:
+        logger.info(f"用戶 {config.user_id} 簽名驗證成功",
+                   extra={"wallet_type": auth_result["wallet_type"]})
 
     session_id = create_session_id(config.user_id, config.ticker)
     
@@ -473,6 +452,7 @@ class StopConfig(BaseModel):
 
 @app.post("/api/grid/stop")
 @limiter.limit(RATE_LIMITS['grid_control'])
+@api_retry
 async def stop_grid(request: Request, config: StopConfig):
     session_id = validate_session_id(config.session_id)
 
@@ -485,43 +465,15 @@ async def stop_grid(request: Request, config: StopConfig):
         )
     user_id = parts[-2]
 
-    # 檢驗 user_sig
-    user_data = await mongo_manager.get_user(user_id)
-    if not user_data:
-        raise GridTradingException(
-            error_code=ErrorCode.USER_NOT_FOUND,
-            details={"user_id": user_id}
-        )
-
-    wallet_address = user_data.get('wallet_address')
-    if not wallet_address:
-        raise GridTradingException(
-            error_code=ErrorCode.INVALID_SIGNATURE,
-            details={"user_id": user_id, "reason": "wallet_address not found"}
-        )
-
-    wallet_type = wallet_verifier.detect_wallet_type(wallet_address)
-    is_valid = False
-
-    if wallet_type == 'evm':
-        is_valid = await wallet_verifier.verify_evm_signature(
-            config.user_sig, wallet_address, config.timestamp, config.nonce
-        )
-    elif wallet_type == 'solana':
-        is_valid = await wallet_verifier.verify_solana_signature(
-            config.user_sig, wallet_address, config.timestamp, config.nonce
-        )
-    else:
-        raise GridTradingException(
-            error_code=ErrorCode.UNKNOWN_WALLET_TYPE,
-            details={"user_id": user_id, "wallet_type": wallet_type}
-        )
-
-    if not is_valid:
-        raise GridTradingException(
-            error_code=ErrorCode.INVALID_SIGNATURE,
-            details={"user_id": user_id, "wallet_type": wallet_type}
-        )
+    # 使用統一的簽名驗證
+    async with WalletAuthContext(
+        user_id,
+        config.user_sig,
+        config.timestamp,
+        config.nonce
+    ) as auth_result:
+        logger.info(f"用戶 {user_id} 簽名驗證成功",
+                   extra={"wallet_type": auth_result["wallet_type"]})
 
     with SessionContextManager(session_id):
         try:

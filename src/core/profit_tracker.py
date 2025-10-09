@@ -3,6 +3,7 @@
 """
 網格交易利潤統計模組
 追蹤交易記錄、計算盈虧、統計績效
+優化版本：使用累計統計而非無限增長的列表
 """
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -20,39 +21,24 @@ class OrderSide(Enum):
     SELL = "賣出"
 
 @dataclass
-class Trade:
-    """單筆交易記錄"""
-    timestamp: float
-    side: OrderSide
-    price: Decimal
-    quantity: Decimal
-    cost: Decimal  # 買入成本或賣出收入（含手續費）
-    fee: Decimal = Decimal('0')
-    trade_id: str = ""
-    
-    def __post_init__(self):
-        if not self.trade_id:
-            self.trade_id = f"{int(self.timestamp)}_{self.side.value}_{self.price}"
-
-@dataclass
-class Position:
-    """持倉記錄（用於配對計算盈虧）"""
+class CurrentPosition:
+    """當前持倉記錄（簡化版本，只保留必要資訊）"""
     buy_price: Decimal
     quantity: Decimal
-    buy_timestamp: float
     buy_cost: Decimal
-    matched: bool = False
-    sell_price: Optional[Decimal] = None
-    sell_timestamp: Optional[float] = None
-    sell_revenue: Optional[Decimal] = None
-    realized_pnl: Optional[Decimal] = None
+    buy_timestamp: float
 
-@dataclass
+@dataclass 
 class GridStats:
-    """網格統計數據"""
+    """網格統計數據（累計版本）"""
+    # 基本交易統計
     total_trades: int = 0
     buy_trades: int = 0
     sell_trades: int = 0
+    
+    # 套利統計（核心指標）
+    arbitrage_count: int = 0  # 套利次數（每次完成買賣配對）
+    total_arbitrage_profit: Decimal = Decimal('0')  # 總套利利潤
     
     # 盈虧統計
     realized_pnl: Decimal = Decimal('0')
@@ -69,12 +55,12 @@ class GridStats:
     total_sell_revenue: Decimal = Decimal('0')
     total_fees: Decimal = Decimal('0')
     
-    # 平均值
-    avg_profit_per_trade: Decimal = Decimal('0')
+    # 平均值統計
+    avg_profit_per_arbitrage: Decimal = Decimal('0')  # 平均每次套利利潤
     avg_win: Decimal = Decimal('0')
     avg_loss: Decimal = Decimal('0')
     
-    # 最大值
+    # 最大值統計
     max_win: Decimal = Decimal('0')
     max_loss: Decimal = Decimal('0')
     
@@ -84,7 +70,7 @@ class GridStats:
     avg_entry_price: Decimal = Decimal('0')
 
 class ProfitTracker:
-    """網格交易利潤追蹤器"""
+    """網格交易利潤追蹤器（記憶體優化版本）"""
     
     def __init__(self, symbol: str, fee_rate: Decimal = Decimal('0.001')):
         """
@@ -97,18 +83,18 @@ class ProfitTracker:
         self.symbol = symbol
         self.fee_rate = fee_rate
         
-        # 交易記錄
-        self.trades: List[Trade] = []
+        # 只保留當前持倉（FIFO 佇列）
+        self.current_positions: List[CurrentPosition] = []
         
-        # 持倉記錄（用於配對）
-        self.open_positions: List[Position] = []  # 未配對的買單
-        self.closed_positions: List[Position] = []  # 已配對的買賣對
-        
-        # 統計數據
+        # 累計統計數據
         self.stats = GridStats()
+        
+        # 運行時統計（用於計算平均值等）
+        self._profit_sum = Decimal('0')  # 盈利交易總和
+        self._loss_sum = Decimal('0')    # 虧損交易總和
     
     def add_trade(self, side: OrderSide, price: Decimal, quantity: Decimal, 
-                  timestamp: float = None, fee: Decimal = None) -> Trade:
+                  timestamp: float = None, fee: Decimal = None) -> Dict:
         """
         添加交易記錄
         
@@ -120,7 +106,7 @@ class ProfitTracker:
             fee: 手續費（可選，不提供則自動計算）
             
         Returns:
-            Trade: 交易記錄對象
+            Dict: 交易結果摘要
         """
         if timestamp is None:
             timestamp = datetime.now().timestamp()
@@ -136,180 +122,176 @@ class ProfitTracker:
         else:
             cost = notional - fee  # 賣出收入扣手續費
         
-        # 創建交易記錄
-        trade = Trade(
-            timestamp=timestamp,
-            side=side,
-            price=price,
-            quantity=quantity,
-            cost=cost,
-            fee=fee
-        )
+        # 更新基本統計
+        self.stats.total_trades += 1
+        self.stats.total_fees += fee
         
-        self.trades.append(trade)
+        if side == OrderSide.BUY:
+            self.stats.buy_trades += 1
+            self.stats.total_buy_cost += cost
+        else:
+            self.stats.sell_trades += 1
+            self.stats.total_sell_revenue += cost
         
-        # 更新持倉和盈虧
-        self._update_positions(trade)
+        # 處理持倉和套利計算
+        arbitrage_info = self._process_position(side, price, quantity, cost, timestamp)
+        
+        # 更新統計
         self._update_stats()
         
         logger.info(f"添加交易記錄: {side.value} {quantity} @ {price}, 成本/收入: {cost}")
         
-        return trade
+        return {
+            "side": side.value,
+            "price": float(price),
+            "quantity": float(quantity),
+            "cost": float(cost),
+            "fee": float(fee),
+            "arbitrage_info": arbitrage_info
+        }
     
-    def _update_positions(self, trade: Trade):
-        """更新持倉記錄"""
-        if trade.side == OrderSide.BUY:
-            # 買入：創建新的持倉記錄
-            position = Position(
-                buy_price=trade.price,
-                quantity=trade.quantity,
-                buy_timestamp=trade.timestamp,
-                buy_cost=trade.cost
+    def _process_position(self, side: OrderSide, price: Decimal, quantity: Decimal, 
+                         cost: Decimal, timestamp: float) -> Dict:
+        """處理持倉和套利計算"""
+        arbitrage_info = {"arbitrage_occurred": False, "arbitrage_profit": Decimal('0')}
+        
+        if side == OrderSide.BUY:
+            # 買入：添加到當前持倉
+            position = CurrentPosition(
+                buy_price=price,
+                quantity=quantity,
+                buy_cost=cost,
+                buy_timestamp=timestamp
             )
-            self.open_positions.append(position)
+            self.current_positions.append(position)
         
         else:  # SELL
-            # 賣出：配對最早的買單（FIFO）
-            remaining_qty = trade.quantity
-            sell_price = trade.price
-            sell_timestamp = trade.timestamp
+            # 賣出：配對最早的買單（FIFO）進行套利計算
+            remaining_qty = quantity
+            total_revenue = cost  # 已扣除手續費
+            total_arbitrage_profit = Decimal('0')
             
-            # 計算這筆賣單的總收入
-            total_revenue = trade.cost  # 已扣除手續費
-            
-            while remaining_qty > Decimal('0') and self.open_positions:
-                # 取出最早的買單
-                position = self.open_positions[0]
+            while remaining_qty > Decimal('0') and self.current_positions:
+                position = self.current_positions[0]
                 
                 if position.quantity <= remaining_qty:
-                    # 這個持倉完全賣出
+                    # 完全賣出這個持倉
                     matched_qty = position.quantity
                     
                     # 計算這部分的收入（按比例）
-                    revenue_ratio = matched_qty / trade.quantity
+                    revenue_ratio = matched_qty / quantity
                     matched_revenue = total_revenue * revenue_ratio
                     
-                    # 計算盈虧
-                    realized_pnl = matched_revenue - position.buy_cost
+                    # 計算套利利潤
+                    arbitrage_profit = matched_revenue - position.buy_cost
+                    total_arbitrage_profit += arbitrage_profit
                     
-                    # 更新持倉記錄
-                    position.matched = True
-                    position.sell_price = sell_price
-                    position.sell_timestamp = sell_timestamp
-                    position.sell_revenue = matched_revenue
-                    position.realized_pnl = realized_pnl
+                    # 更新統計
+                    self.stats.arbitrage_count += 1
+                    self.stats.total_arbitrage_profit += arbitrage_profit
+                    self.stats.realized_pnl += arbitrage_profit
                     
-                    # 移到已平倉列表
-                    self.closed_positions.append(position)
-                    self.open_positions.pop(0)
+                    # 更新勝負統計
+                    if arbitrage_profit > 0:
+                        self.stats.winning_trades += 1
+                        self._profit_sum += arbitrage_profit
+                        if arbitrage_profit > self.stats.max_win:
+                            self.stats.max_win = arbitrage_profit
+                    elif arbitrage_profit < 0:
+                        self.stats.losing_trades += 1
+                        self._loss_sum += arbitrage_profit
+                        if arbitrage_profit < self.stats.max_loss:
+                            self.stats.max_loss = arbitrage_profit
                     
+                    # 移除已完全賣出的持倉
+                    self.current_positions.pop(0)
                     remaining_qty -= matched_qty
                 
                 else:
-                    # 持倉部分賣出
+                    # 部分賣出持倉
                     matched_qty = remaining_qty
                     
-                    # 計算這部分的收入
-                    revenue_ratio = matched_qty / trade.quantity
+                    # 計算這部分的收入和成本
+                    revenue_ratio = matched_qty / quantity
                     matched_revenue = total_revenue * revenue_ratio
                     
-                    # 計算這部分的成本
                     cost_ratio = matched_qty / position.quantity
                     matched_cost = position.buy_cost * cost_ratio
                     
-                    # 計算盈虧
-                    realized_pnl = matched_revenue - matched_cost
+                    # 計算套利利潤
+                    arbitrage_profit = matched_revenue - matched_cost
+                    total_arbitrage_profit += arbitrage_profit
                     
-                    # 創建已平倉記錄
-                    closed_position = Position(
-                        buy_price=position.buy_price,
-                        quantity=matched_qty,
-                        buy_timestamp=position.buy_timestamp,
-                        buy_cost=matched_cost,
-                        matched=True,
-                        sell_price=sell_price,
-                        sell_timestamp=sell_timestamp,
-                        sell_revenue=matched_revenue,
-                        realized_pnl=realized_pnl
-                    )
-                    self.closed_positions.append(closed_position)
+                    # 更新統計
+                    self.stats.arbitrage_count += 1
+                    self.stats.total_arbitrage_profit += arbitrage_profit
+                    self.stats.realized_pnl += arbitrage_profit
                     
-                    # 更新原持倉（減少數量）
+                    # 更新勝負統計
+                    if arbitrage_profit > 0:
+                        self.stats.winning_trades += 1
+                        self._profit_sum += arbitrage_profit
+                        if arbitrage_profit > self.stats.max_win:
+                            self.stats.max_win = arbitrage_profit
+                    elif arbitrage_profit < 0:
+                        self.stats.losing_trades += 1
+                        self._loss_sum += arbitrage_profit
+                        if arbitrage_profit < self.stats.max_loss:
+                            self.stats.max_loss = arbitrage_profit
+                    
+                    # 更新原持倉（減少數量和成本）
                     position.quantity -= matched_qty
                     position.buy_cost -= matched_cost
                     
                     remaining_qty = Decimal('0')
+            
+            if total_arbitrage_profit != Decimal('0'):
+                arbitrage_info = {
+                    "arbitrage_occurred": True,
+                    "arbitrage_profit": float(total_arbitrage_profit)
+                }
+        
+        return arbitrage_info
     
     def _update_stats(self):
         """更新統計數據"""
-        # 基本統計
-        self.stats.total_trades = len(self.trades)
-        self.stats.buy_trades = sum(1 for t in self.trades if t.side == OrderSide.BUY)
-        self.stats.sell_trades = sum(1 for t in self.trades if t.side == OrderSide.SELL)
-        
-        # 計算已實現盈虧
-        self.stats.realized_pnl = sum(
-            pos.realized_pnl for pos in self.closed_positions
-        )
-        
-        # 總盈虧
-        self.stats.total_pnl = self.stats.realized_pnl + self.stats.unrealized_pnl
-        
-        # 勝率統計
-        self.stats.winning_trades = sum(
-            1 for pos in self.closed_positions if pos.realized_pnl > 0
-        )
-        self.stats.losing_trades = sum(
-            1 for pos in self.closed_positions if pos.realized_pnl < 0
-        )
-        
-        total_closed = len(self.closed_positions)
+        # 計算勝率
+        total_closed = self.stats.winning_trades + self.stats.losing_trades
         if total_closed > 0:
             self.stats.win_rate = (
                 Decimal(str(self.stats.winning_trades)) / Decimal(str(total_closed)) * Decimal('100')
             ).quantize(Decimal('0.01'))
         
-        # 金額統計
-        self.stats.total_buy_cost = sum(
-            t.cost for t in self.trades if t.side == OrderSide.BUY
-        )
-        self.stats.total_sell_revenue = sum(
-            t.cost for t in self.trades if t.side == OrderSide.SELL
-        )
-        self.stats.total_fees = sum(t.fee for t in self.trades)
-        
-        # 平均值
-        if total_closed > 0:
-            self.stats.avg_profit_per_trade = (
-                self.stats.realized_pnl / Decimal(str(total_closed))
+        # 計算平均套利利潤
+        if self.stats.arbitrage_count > 0:
+            self.stats.avg_profit_per_arbitrage = (
+                self.stats.total_arbitrage_profit / Decimal(str(self.stats.arbitrage_count))
             ).quantize(Decimal('0.01'))
         
+        # 計算平均盈利和虧損
         if self.stats.winning_trades > 0:
-            winning_pnls = [pos.realized_pnl for pos in self.closed_positions if pos.realized_pnl > 0]
             self.stats.avg_win = (
-                sum(winning_pnls) / Decimal(str(len(winning_pnls)))
+                self._profit_sum / Decimal(str(self.stats.winning_trades))
             ).quantize(Decimal('0.01'))
         
         if self.stats.losing_trades > 0:
-            losing_pnls = [pos.realized_pnl for pos in self.closed_positions if pos.realized_pnl < 0]
             self.stats.avg_loss = (
-                sum(losing_pnls) / Decimal(str(len(losing_pnls)))
+                self._loss_sum / Decimal(str(self.stats.losing_trades))
             ).quantize(Decimal('0.01'))
         
-        # 最大值
-        if self.closed_positions:
-            all_pnls = [pos.realized_pnl for pos in self.closed_positions]
-            self.stats.max_win = max(all_pnls)
-            self.stats.max_loss = min(all_pnls)
-        
         # 當前持倉統計
-        self.stats.current_position_qty = sum(pos.quantity for pos in self.open_positions)
-        self.stats.current_position_cost = sum(pos.buy_cost for pos in self.open_positions)
+        self.stats.current_position_qty = sum(pos.quantity for pos in self.current_positions)
+        self.stats.current_position_cost = sum(pos.buy_cost for pos in self.current_positions)
         
         if self.stats.current_position_qty > 0:
             self.stats.avg_entry_price = (
                 self.stats.current_position_cost / self.stats.current_position_qty
             ).quantize(Decimal('0.01'))
+        else:
+            self.stats.avg_entry_price = Decimal('0')
+        
+        # 總盈虧
+        self.stats.total_pnl = self.stats.realized_pnl + self.stats.unrealized_pnl
     
     def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """
@@ -323,7 +305,7 @@ class ProfitTracker:
         """
         unrealized = Decimal('0')
         
-        for position in self.open_positions:
+        for position in self.current_positions:
             # 當前市值
             current_value = position.quantity * current_price
             # 扣除賣出手續費
@@ -358,7 +340,11 @@ class ProfitTracker:
             "total_trades": self.stats.total_trades,
             "buy_trades": self.stats.buy_trades,
             "sell_trades": self.stats.sell_trades,
-            "completed_pairs": len(self.closed_positions),
+            
+            # 套利統計（核心指標）
+            "arbitrage_count": self.stats.arbitrage_count,
+            "total_arbitrage_profit": f"{self.stats.total_arbitrage_profit:.2f} USDT",
+            "avg_profit_per_arbitrage": f"{self.stats.avg_profit_per_arbitrage:.2f} USDT",
             
             # 盈虧統計
             "realized_pnl": f"{self.stats.realized_pnl:.2f} USDT",
@@ -376,7 +362,6 @@ class ProfitTracker:
             "total_fees": f"{self.stats.total_fees:.2f} USDT",
             
             # 平均值
-            "avg_profit_per_trade": f"{self.stats.avg_profit_per_trade:.2f} USDT",
             "avg_win": f"{self.stats.avg_win:.2f} USDT",
             "avg_loss": f"{self.stats.avg_loss:.2f} USDT",
             
@@ -388,46 +373,11 @@ class ProfitTracker:
             "current_position_qty": f"{self.stats.current_position_qty}",
             "current_position_cost": f"{self.stats.current_position_cost:.2f} USDT",
             "avg_entry_price": f"{self.stats.avg_entry_price:.2f} USDT",
-            "open_positions_count": len(self.open_positions),
+            "open_positions_count": len(self.current_positions),
         }
     
-    def get_trade_history(self, limit: int = None) -> List[Dict]:
-        """獲取交易歷史"""
-        trades = self.trades[-limit:] if limit else self.trades
-        
-        return [
-            {
-                "timestamp": datetime.fromtimestamp(t.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-                "side": t.side.value,
-                "price": f"{t.price:.2f}",
-                "quantity": f"{t.quantity:.6f}",
-                "cost": f"{t.cost:.2f}",
-                "fee": f"{t.fee:.2f}",
-            }
-            for t in trades
-        ]
-    
-    def get_closed_positions(self, limit: int = None) -> List[Dict]:
-        """獲取已平倉記錄"""
-        positions = self.closed_positions[-limit:] if limit else self.closed_positions
-        
-        return [
-            {
-                "buy_time": datetime.fromtimestamp(pos.buy_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-                "buy_price": f"{pos.buy_price:.2f}",
-                "sell_time": datetime.fromtimestamp(pos.sell_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-                "sell_price": f"{pos.sell_price:.2f}",
-                "quantity": f"{pos.quantity:.6f}",
-                "buy_cost": f"{pos.buy_cost:.2f}",
-                "sell_revenue": f"{pos.sell_revenue:.2f}",
-                "realized_pnl": f"{pos.realized_pnl:.2f}",
-                "pnl_pct": f"{(pos.realized_pnl / pos.buy_cost * 100):.2f}%",
-            }
-            for pos in positions
-        ]
-    
-    def get_open_positions(self) -> List[Dict]:
-        """獲取未平倉記錄"""
+    def get_current_positions(self) -> List[Dict]:
+        """獲取當前持倉記錄"""
         return [
             {
                 "buy_time": datetime.fromtimestamp(pos.buy_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
@@ -435,16 +385,42 @@ class ProfitTracker:
                 "quantity": f"{pos.quantity:.6f}",
                 "buy_cost": f"{pos.buy_cost:.2f}",
             }
-            for pos in self.open_positions
+            for pos in self.current_positions
         ]
     
-    def export_to_json(self, filepath: str):
-        """導出統計數據到 JSON 文件"""
+    def get_stats_summary(self) -> Dict:
+        """獲取統計摘要（不包含歷史記錄）"""
+        return {
+            "arbitrage_statistics": {
+                "total_arbitrage_count": self.stats.arbitrage_count,
+                "total_arbitrage_profit": f"{self.stats.total_arbitrage_profit:.2f} USDT",
+                "avg_profit_per_arbitrage": f"{self.stats.avg_profit_per_arbitrage:.2f} USDT",
+            },
+            "trading_statistics": {
+                "total_trades": self.stats.total_trades,
+                "buy_trades": self.stats.buy_trades,
+                "sell_trades": self.stats.sell_trades,
+                "win_rate": f"{self.stats.win_rate}%",
+            },
+            "pnl_statistics": {
+                "realized_pnl": f"{self.stats.realized_pnl:.2f} USDT",
+                "unrealized_pnl": f"{self.stats.unrealized_pnl:.2f} USDT",
+                "total_pnl": f"{self.stats.total_pnl:.2f} USDT",
+            },
+            "position_statistics": {
+                "current_positions": len(self.current_positions),
+                "current_position_qty": f"{self.stats.current_position_qty}",
+                "current_position_cost": f"{self.stats.current_position_cost:.2f} USDT",
+                "avg_entry_price": f"{self.stats.avg_entry_price:.2f} USDT",
+            }
+        }
+    
+    def export_stats_to_json(self, filepath: str):
+        """導出統計數據到 JSON 文件（不包含歷史記錄）"""
         data = {
             "summary": self.get_summary(),
-            "trade_history": self.get_trade_history(),
-            "closed_positions": self.get_closed_positions(),
-            "open_positions": self.get_open_positions(),
+            "detailed_stats": self.get_stats_summary(),
+            "current_positions": self.get_current_positions(),
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -455,14 +431,18 @@ class ProfitTracker:
         summary = self.get_summary(current_price)
         
         print("\n" + "="*60)
-        print(f"網格交易統計 - {summary['symbol']}")
+        print(f"網格交易統計 - {summary['symbol']} (記憶體優化版)")
         print("="*60)
         
         print(f"\n📊 交易統計")
         print(f"  總交易數: {summary['total_trades']}")
         print(f"  買入次數: {summary['buy_trades']}")
         print(f"  賣出次數: {summary['sell_trades']}")
-        print(f"  完成配對: {summary['completed_pairs']}")
+        
+        print(f"\n🔄 套利統計")
+        print(f"  套利次數: {summary['arbitrage_count']}")
+        print(f"  總套利利潤: {summary['total_arbitrage_profit']}")
+        print(f"  平均每次套利: {summary['avg_profit_per_arbitrage']}")
         
         print(f"\n💰 盈虧統計")
         print(f"  已實現盈虧: {summary['realized_pnl']}")
@@ -473,7 +453,6 @@ class ProfitTracker:
         print(f"  勝率: {summary['win_rate']}")
         print(f"  盈利次數: {summary['winning_trades']}")
         print(f"  虧損次數: {summary['losing_trades']}")
-        print(f"  平均每筆利潤: {summary['avg_profit_per_trade']}")
         print(f"  平均盈利: {summary['avg_win']}")
         print(f"  平均虧損: {summary['avg_loss']}")
         print(f"  最大盈利: {summary['max_win']}")
@@ -491,3 +470,22 @@ class ProfitTracker:
         print(f"  未平倉筆數: {summary['open_positions_count']}")
         
         print("="*60 + "\n")
+
+    # 為了向後兼容，保留一些舊方法但返回空列表或提示
+    def get_trade_history(self, limit: int = None) -> List[Dict]:
+        """獲取交易歷史（記憶體優化版本不保存歷史記錄）"""
+        logger.warning("記憶體優化版本不保存交易歷史記錄，請使用 get_stats_summary() 獲取統計資料")
+        return []
+    
+    def get_closed_positions(self, limit: int = None) -> List[Dict]:
+        """獲取已平倉記錄（記憶體優化版本不保存歷史記錄）"""
+        logger.warning("記憶體優化版本不保存已平倉記錄，請使用 get_stats_summary() 獲取統計資料")
+        return []
+    
+    def get_open_positions(self) -> List[Dict]:
+        """獲取未平倉記錄（重定向到 get_current_positions）"""
+        return self.get_current_positions()
+    
+    def export_to_json(self, filepath: str):
+        """導出統計數據到 JSON 文件（重定向到 export_stats_to_json）"""
+        self.export_stats_to_json(filepath)

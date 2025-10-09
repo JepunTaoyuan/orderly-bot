@@ -60,6 +60,9 @@ class ErrorCode(Enum):
     USER_CREATION_FAILED = "E7002"
     USER_UPDATE_FAILED = "E7003"
 
+    # 斷路器錯誤 (8000-8999)
+    CIRCUIT_BREAKER_OPEN = "E8000"
+
 
 @dataclass
 class ErrorDetail:
@@ -258,6 +261,15 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         description="Failed to update user information",
         http_status=500,
         user_message="更新用戶信息失敗"
+    ),
+
+    # 斷路器錯誤
+    ErrorCode.CIRCUIT_BREAKER_OPEN: ErrorDetail(
+        code=ErrorCode.CIRCUIT_BREAKER_OPEN,
+        message="Circuit breaker is open",
+        description="The service is temporarily unavailable due to repeated failures",
+        http_status=503,
+        user_message="服務暫時不可用，請稍後重試"
     ),
 }
 

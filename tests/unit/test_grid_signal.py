@@ -8,7 +8,7 @@ import pytest
 from decimal import Decimal
 from unittest.mock import Mock, AsyncMock, patch
 from src.core.grid_signal import (
-    GridSignalGenerator, Direction, OrderSide, TradingSignal
+    GridSignalGenerator, Direction, OrderSide, TradingSignal, GridType
 )
 
 
@@ -835,3 +835,209 @@ class TestGridSignalGenerator:
         )
 
         assert signal is not None
+
+
+class TestGeometricGridSignalGenerator:
+    """等比網格信號生成器測試"""
+    
+    def test_geometric_grid_initialization(self):
+        """測試等比網格正確初始化"""
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=10,
+            total_margin=1000,
+            grid_type=GridType.GEOMETRIC,
+            grid_ratio=0.02
+        )
+        
+        assert generator.grid_type == GridType.GEOMETRIC
+        assert generator.grid_ratio == Decimal('0.02')
+        assert len(generator.grid_prices) == 10
+    
+    def test_geometric_grid_missing_ratio(self):
+        """測試等比網格缺少 grid_ratio 參數時拋出錯誤"""
+        with pytest.raises(ValueError, match="等比網格必須提供 grid_ratio 參數"):
+            GridSignalGenerator(
+                ticker="PERP_BTC_USDC",
+                current_price=50000,
+                direction=Direction.BOTH,
+                upper_bound=60000,
+                lower_bound=40000,
+                grid_levels=10,
+                total_margin=1000,
+                grid_type=GridType.GEOMETRIC
+            )
+    
+    def test_geometric_grid_invalid_ratio_zero(self):
+        """測試等比網格 grid_ratio 為 0 時拋出錯誤"""
+        with pytest.raises(ValueError, match="grid_ratio 必須大於 0"):
+            GridSignalGenerator(
+                ticker="PERP_BTC_USDC",
+                current_price=50000,
+                direction=Direction.BOTH,
+                upper_bound=60000,
+                lower_bound=40000,
+                grid_levels=10,
+                total_margin=1000,
+                grid_type=GridType.GEOMETRIC,
+                grid_ratio=0
+            )
+    
+    def test_geometric_grid_invalid_ratio_negative(self):
+        """測試等比網格 grid_ratio 為負數時拋出錯誤"""
+        with pytest.raises(ValueError, match="grid_ratio 必須大於 0"):
+            GridSignalGenerator(
+                ticker="PERP_BTC_USDC",
+                current_price=50000,
+                direction=Direction.BOTH,
+                upper_bound=60000,
+                lower_bound=40000,
+                grid_levels=10,
+                total_margin=1000,
+                grid_type=GridType.GEOMETRIC,
+                grid_ratio=-0.01
+            )
+    
+    def test_geometric_grid_invalid_ratio_too_large(self):
+        """測試等比網格 grid_ratio 大於等於 1 時拋出錯誤"""
+        with pytest.raises(ValueError, match="grid_ratio 必須小於 1"):
+            GridSignalGenerator(
+                ticker="PERP_BTC_USDC",
+                current_price=50000,
+                direction=Direction.BOTH,
+                upper_bound=60000,
+                lower_bound=40000,
+                grid_levels=10,
+                total_margin=1000,
+                grid_type=GridType.GEOMETRIC,
+                grid_ratio=1.0
+            )
+    
+    def test_geometric_grid_price_calculation(self):
+        """測試等比網格價格計算"""
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=6,
+            total_margin=1000,
+            grid_type=GridType.GEOMETRIC,
+            grid_ratio=0.05  # 5%
+        )
+        
+        prices = generator.grid_prices
+        assert len(prices) == 6
+        
+        # 檢查價格是否按等比數列排列
+        # 等比網格的實現是：下方價格 = current_price * (1 - ratio)^i，上方價格 = current_price * (1 + ratio)^i
+        current_price = Decimal('50000')
+        ratio = Decimal('0.05')
+        
+        # 分離上方和下方價格
+        below_prices = [p for p in prices if p < current_price]
+        above_prices = [p for p in prices if p > current_price]
+        
+        # 檢查下方價格的等比關係
+        if len(below_prices) > 1:
+            below_prices.sort()  # 從低到高排序
+            for i in range(len(below_prices) - 1):
+                # 下方價格應該是遞增的等比數列
+                ratio_actual = float(below_prices[i+1] / below_prices[i])
+                expected_ratio = float((Decimal('1') - ratio) ** -1)  # 因為是從低到高，所以是倒數關係
+                assert abs(ratio_actual - expected_ratio) < 0.01, f"下方價格比率不正確: {ratio_actual}, 期望: {expected_ratio}"
+        
+        # 檢查上方價格的等比關係
+        if len(above_prices) > 1:
+            above_prices.sort()  # 從低到高排序
+            for i in range(len(above_prices) - 1):
+                # 上方價格應該是遞增的等比數列
+                ratio_actual = float(above_prices[i+1] / above_prices[i])
+                expected_ratio = float(Decimal('1') + ratio)
+                assert abs(ratio_actual - expected_ratio) < 0.01, f"上方價格比率不正確: {ratio_actual}, 期望: {expected_ratio}"
+    
+    def test_geometric_grid_position_size_calculation(self):
+        """測試等比網格倉位大小計算"""
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=10,
+            total_margin=1000,
+            grid_type=GridType.GEOMETRIC,
+            grid_ratio=0.02
+        )
+        
+        # 測試等比網格的動態倉位計算
+        price1 = Decimal('45000')
+        price2 = Decimal('55000')
+        
+        size1 = generator._calculate_position_size(price1)
+        size2 = generator._calculate_position_size(price2)
+        
+        # 等比網格應該根據價格動態調整倉位大小
+        # 價格越高，倉位應該越小（保持相同的投資金額）
+        assert size1 > size2
+        
+        # 檢查投資金額是否相近（允許一定誤差）
+        investment1 = size1 * price1
+        investment2 = size2 * price2
+        assert abs(investment1 - investment2) < Decimal('1')  # 允許1 USDT誤差
+    
+    def test_geometric_grid_setup_initial_grid(self):
+        """測試等比網格初始網格設置"""
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=10,
+            total_margin=1000,
+            grid_type=GridType.GEOMETRIC,
+            grid_ratio=0.02
+        )
+        
+        # 檢查是否正確設置了網格參數
+        assert generator.grid_type == GridType.GEOMETRIC
+        assert generator.grid_ratio == Decimal('0.02')
+        assert generator.quantity_per_grid > 0  # 應該有基礎數量
+    
+    def test_arithmetic_grid_with_ratio_should_fail(self):
+        """測試等差網格提供 grid_ratio 參數時不應該拋出錯誤（因為會被忽略）"""
+        # 等差網格提供 grid_ratio 參數應該被忽略，不拋出錯誤
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=10,
+            total_margin=1000,
+            grid_type=GridType.ARITHMETIC,
+            grid_ratio=0.02  # 這個參數會被忽略
+        )
+        
+        assert generator.grid_type == GridType.ARITHMETIC
+        # 等差網格不使用 grid_ratio
+    
+    def test_default_grid_type_is_arithmetic(self):
+        """測試默認網格類型是等差網格"""
+        generator = GridSignalGenerator(
+            ticker="PERP_BTC_USDC",
+            current_price=50000,
+            direction=Direction.BOTH,
+            upper_bound=60000,
+            lower_bound=40000,
+            grid_levels=10,
+            total_margin=1000
+        )
+        
+        assert generator.grid_type == GridType.ARITHMETIC

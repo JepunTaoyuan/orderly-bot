@@ -1,4 +1,8 @@
 {
+  "env": {
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6"
+  },
   "permissions": {
     "allow": [
       "Bash(tree:*)",
@@ -8,7 +12,8 @@
       "Bash(python -m pytest:*)",
       "Bash(python3:*)",
       "Bash(python:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(PYTHONPATH=/mnt/c/Users/user/Desktop/orderly_back/orderly_bot python:*)"
     ],
     "deny": [],
     "ask": []
