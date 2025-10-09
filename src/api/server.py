@@ -62,8 +62,8 @@ session_manager = SessionManager()
 # 全域MongoDB管理器
 mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """應用啟動時的初始化"""
     try:
         # 初始化錢包驗證器的數據庫連接
@@ -303,7 +303,7 @@ class StartConfig(BaseModel):
             "upper_bound": 45000,
             "lower_bound": 40000,
             "grid_levels": 6,
-            "total_amount": 100,
+            "total_margin": 100,
             "stop_bot_price": 38000,
             "stop_top_price": 47000,
             "user_id": "user123",
@@ -319,7 +319,7 @@ class StartConfig(BaseModel):
     upper_bound: float = Field(..., gt=0)
     lower_bound: float = Field(..., gt=0)
     grid_levels: int = Field(..., ge=2)
-    total_amount: float = Field(..., gt=0)
+    total_margin: float = Field(..., gt=0)
     stop_bot_price: Optional[float] = Field(None, gt=0)
     stop_top_price: Optional[float] = Field(None, gt=0)
     user_id: str = Field(..., min_length=1)
@@ -358,7 +358,7 @@ class StartConfig(BaseModel):
             "upper_bound": self.upper_bound,
             "lower_bound": self.lower_bound,
             "grid_levels": self.grid_levels,
-            "total_amount": self.total_amount,
+            "total_margin": self.total_margin,
             "stop_bot_price": self.stop_bot_price,
             "stop_top_price": self.stop_top_price,
             "user_id": self.user_id,
@@ -582,6 +582,7 @@ async def get_status(request: Request, session_id: str):
         )
 
 @app.get("/api/grid/sessions")
+@limiter.limit(RATE_LIMITS['status_check'])
 async def list_sessions():
     try:
         sessions = await session_manager.list_sessions()
@@ -590,6 +591,50 @@ async def list_sessions():
         logger.error("列出會話失敗", event_type="list_sessions_error", data={"error": str(e)})
         raise GridTradingException(
             error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            original_error=e
+        )
+
+@app.get("/api/grid/profit/{session_id}")
+@limiter.limit(RATE_LIMITS['status_check'])
+async def get_profit_report(request: Request, session_id: str):
+    """
+    獲取網格交易利潤報告
+    
+    Args:
+        session_id: 會話ID
+        
+    Returns:
+        利潤統計報告
+    """
+    try:
+        # 驗證會話ID
+        session_id = validate_session_id(session_id)
+        
+        # 從會話管理器獲取機器人實例
+        async with session_manager._sessions_lock:
+            if session_id not in session_manager.sessions:
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_NOT_FOUND,
+                    details={"session_id": session_id}
+                )
+            
+            bot = session_manager.sessions[session_id]
+        
+        # 獲取利潤報告
+        profit_report = await bot.get_profit_report()
+        
+        return {"success": True, "data": profit_report}
+        
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("獲取利潤報告失敗", event_type="profit_report_error", data={
+            "session_id": session_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"session_id": session_id},
             original_error=e
         )
 

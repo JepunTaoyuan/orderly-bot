@@ -3,7 +3,10 @@
     "allow": [
       "Bash(tree:*)",
       "mcp__deepwiki__read_wiki_contents",
-      "mcp__deepwiki__ask_question"
+      "mcp__deepwiki__ask_question",
+      "Bash(pytest:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []
