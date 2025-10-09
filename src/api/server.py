@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic import model_validator
+from contextlib import asynccontextmanager
 
 from src.core.grid_signal import Direction
 from src.utils.session_manager import SessionManager

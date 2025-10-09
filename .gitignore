@@ -25,7 +25,6 @@ dist/
 .cache/
 .mypy_cache/
 ruff_cache/
-tests/
 analysis/
 
 # Editors/OS

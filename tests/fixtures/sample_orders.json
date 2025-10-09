@@ -1,0 +1,31 @@
+{
+  "limit_order": {
+    "order_id": 12345,
+    "symbol": "PERP_BTC_USDC",
+    "side": "BUY",
+    "order_type": "LIMIT",
+    "price": 42500.50,
+    "quantity": 0.001,
+    "status": "NEW"
+  },
+  "market_order": {
+    "order_id": 12346,
+    "symbol": "PERP_BTC_USDC",
+    "side": "SELL",
+    "order_type": "MARKET",
+    "quantity": 0.001,
+    "status": "FILLED"
+  },
+  "filled_order": {
+    "order_id": 12347,
+    "symbol": "PERP_BTC_USDC",
+    "side": "BUY",
+    "order_type": "LIMIT",
+    "price": 42500.50,
+    "quantity": 0.001,
+    "status": "FILLED",
+    "executed_price": 42500.50,
+    "executed_quantity": 0.001,
+    "executed_timestamp": 1234567890
+  }
+}
