@@ -37,6 +37,7 @@ from src.utils.resilient_handler import api_retry
 from src.utils.slowapi_limiter import get_slowapi_rate_limiter, limiter, RATE_LIMITS
 from slowapi.errors import RateLimitExceeded
 from src.utils.slowapi_dependencies import auto_rate_limit
+from src.core.grid_signal import GridType
 
 
 load_dotenv()
@@ -76,6 +77,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"安全組件初始化失敗: {e}")
         # 初始化失敗不應該阻止應用啟動
+    
+    # 應用運行期間
+    yield
+    
+    # 應用關閉時的清理
+    logger.info("應用正在關閉，執行清理操作...")
 
 app = FastAPI(title="Grid Trading Server", version="1.0.0", lifespan=lifespan)
 
@@ -182,7 +189,7 @@ async def enable_bot_trading(request: Request, config: RegisterConfig):
             raise GridTradingException(
                 error_code=ErrorCode.USER_ALREADY_EXISTS,
                 details={"user_id": config.user_id}
-            )
+            )  
 
         # 創建用戶
         result = await mongo_manager.create_user(
@@ -310,6 +317,8 @@ class StartConfig(BaseModel):
             "current_price": 42500,
             "upper_bound": 45000,
             "lower_bound": 40000,
+            "grid_type": "ARITHMETIC",
+            "grid_ratio": 0.5,
             "grid_levels": 6,
             "total_margin": 100,
             "stop_bot_price": 38000,
@@ -326,6 +335,8 @@ class StartConfig(BaseModel):
     current_price: float = Field(..., gt=0)
     upper_bound: float = Field(..., gt=0)
     lower_bound: float = Field(..., gt=0)
+    grid_type: str = Field("ARITHMETIC", pattern="^(ARITHMETIC|GEOMETRIC)$")
+    grid_ratio: Optional[float] = Field(None, gt=0, lt=1)
     grid_levels: int = Field(..., ge=2)
     total_margin: float = Field(..., gt=0)
     stop_bot_price: Optional[float] = Field(None, gt=0)
@@ -351,6 +362,12 @@ class StartConfig(BaseModel):
             
         return self
 
+    @model_validator(mode="after")
+    def validate_grid_type(self):
+        if self.grid_type == "GEOMETRIC" and self.grid_ratio is None:
+            raise ValueError("等比網格必須提供 grid_ratio")
+        return self
+
     def to_internal(self) -> dict:
         # 轉 Direction 枚舉
         dir_map = {
@@ -358,13 +375,22 @@ class StartConfig(BaseModel):
             "SHORT": Direction.SHORT,
             "BOTH": Direction.BOTH,
         }
+
+        type_map = {
+            "ARITHMETIC": GridType.ARITHMETIC,
+            "GEOMETRIC": GridType.GEOMETRIC,
+        }
+
         direction_enum = dir_map[self.direction]
+        grid_type_enum = type_map[self.grid_type]
         return {
             "ticker": self.ticker,
             "direction": direction_enum,
             "current_price": self.current_price,
             "upper_bound": self.upper_bound,
             "lower_bound": self.lower_bound,
+            "grid_type": grid_type_enum,
+            "grid_ratio": self.grid_ratio,
             "grid_levels": self.grid_levels,
             "total_margin": self.total_margin,
             "stop_bot_price": self.stop_bot_price,

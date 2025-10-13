@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-網格交易訊號生成器 - 固定數量版本
-專注於產生交易訊號，不執行實際交易操作
-改進：使用固定數量而非固定金額，確保買賣對稱
+網格交易訊號生成器 - 支持等差和等比網格
 
-支援兩種網格類型：
-1. 等差網格（ARITHMETIC）：價格點之間的間距相等，適合震盪行情
-2. 等比網格（GEOMETRIC）：價格點按幾何級數分佈，適合趨勢行情
-   - 需要指定 grid_ratio 參數（0 < grid_ratio < 1）
-   - 計算公式：下方網格 = 當前價格 × (1 - grid_ratio)^i
-              上方網格 = 當前價格 × (1 + grid_ratio)^i
+## 網格類型選擇指南
+
+### 等差網格 (ARITHMETIC)
+- 固定價格間距
+- 適合震盪行情、價格波動相對穩定
+- 每格數量固定
+- 例：BTC 40000-50000，間距 1000
+
+### 等比網格 (GEOMETRIC)  
+- 固定百分比間距
+- 適合趨勢行情、價格大幅波動
+- 每格金額固定、數量動態調整
+- 例：BTC 價格翻倍時，低價區數量多、高價區數量少
+
+## 等比網格參數說明
+
+grid_ratio: 比例參數，建議範圍 0.01-0.1
+- 0.01 (1%): 網格密集，適合小波動
+- 0.05 (5%): 網格適中，通用場景
+- 0.10 (10%): 網格稀疏，適合大波動
+
+注意事項：
+1. grid_ratio 過大可能導致實際網格數少於預期
+2. 等比網格在極端價格下可能無法精確到達邊界
+3. 建議價格範圍至少為當前價格的 ±20%
 """
 
 import math
@@ -232,15 +249,21 @@ class GridSignalGenerator:
         lower_grids = [p for p in self.grid_prices if p < self.current_price]
         
         if lower_grids:
-            # ⭐ 用最低價計算（確保在最低價時保證金也夠用）
-            reference_price = min(lower_grids)
-            num_grids = len(lower_grids)
-            margin_per_grid = self.grid_margin / Decimal(str(num_grids))
-            
-            # 固定數量 = 每格保證金 / 參考價格
-            self.quantity_per_grid = (
-                margin_per_grid / reference_price
-            ).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+            if self.grid_type == GridType.ARITHMETIC:
+                # ⭐ 用最低價計算（確保在最低價時保證金也夠用）
+                reference_price = min(lower_grids)
+                num_grids = len(lower_grids)
+                margin_per_grid = self.grid_margin / Decimal(str(num_grids))
+                
+                # 固定數量 = 每格保證金 / 參考價格
+                self.quantity_per_grid = (
+                    margin_per_grid / reference_price
+                ).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+            else:  # GEOMETRIC
+                # 等比網格：只需要記錄每格保證金，數量動態計算
+                num_grids = len(lower_grids)
+                self.margin_per_grid = self.grid_margin / Decimal(str(num_grids))
+                self.quantity_per_grid = Decimal('0')  # 不使用固定數量
             
             logger.info(
                 "做多網格設置完成",
@@ -357,15 +380,12 @@ class GridSignalGenerator:
             if price is None:
                 raise ValueError("等比網格計算倉位大小時必須提供價格")
             
-            # 每格固定投資金額
-            margin_per_grid = self.total_margin / Decimal(str(self.grid_levels))
-            
-            # 數量 = 投資金額 / 價格
-            quantity = (margin_per_grid / price).quantize(
+            # 使用初始化時計算的每格保證金
+            quantity = (self.margin_per_grid / price).quantize(
                 Decimal('0.000001'), rounding=ROUND_HALF_UP
-            )
-            
-            return quantity
+        )
+        
+        return quantity
     
     def _emit_signal(self, side: OrderSide, price: Decimal, size: Decimal, signal_type: str) -> TradingSignal:
         """

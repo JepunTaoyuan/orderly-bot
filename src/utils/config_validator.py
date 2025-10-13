@@ -264,7 +264,6 @@ class ConfigValidator:
                 "nonce": validated_config.nonce,
                 "grid_params": grid_params,
                 "_market_info": market_info,
-                "_orderly_symbol": self._convert_to_orderly_symbol(validated_config.ticker)
             }
 
             logger.info(
@@ -346,16 +345,6 @@ class ConfigValidator:
             raise ValueError(
                 f"單格訂單金額 {estimated_order_value} 小於最小限制 {min_notional}"
             )
-
-    def _convert_to_orderly_symbol(self, ticker: str) -> str:
-        """轉換為 Orderly 格式的交易對"""
-        # 簡單的轉換規則，實際可能需要更複雜的邏輯
-        if ticker == "BTCUSDT":
-            return "PERP_BTC_USDC"
-        elif ticker == "ETHUSDT":
-            return "PERP_ETH_USDC"
-        else:
-            return f"PERP_{ticker.replace('USDT', '')}_USDC"
 
 # 全局實例
 config_validator = ConfigValidator()

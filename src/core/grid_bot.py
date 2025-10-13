@@ -27,6 +27,11 @@ class GridTradingBot:
     PROCESSED_FILLS_TTL = 300
     ORDER_CREATION_DELAY = 0.1
 
+    # WebSocket 重連配置
+    WS_RECONNECT_MAX_RETRIES = 5
+    WS_RECONNECT_BASE_DELAY = 2  # 秒
+    WS_RECONNECT_MAX_DELAY = 60  # 秒
+
     def __init__(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
         """初始化網格交易機器人"""
         self.client = OrderlyClient(account_id = account_id, orderly_key = orderly_key, orderly_secret = orderly_secret, orderly_testnet = orderly_testnet)
@@ -41,6 +46,11 @@ class GridTradingBot:
         self.market_info = None
         self.order_tracker = OrderTracker()
         self.session_id = None
+
+        self.ws_reconnect_task = None
+        self.ws_reconnect_attempts = 0
+        self.ws_should_reconnect = True  # 控制是否應該重連
+        self.ws_credentials = None  # 保存 WebSocket 憑證
         
         # ⭐ 新增：利潤追蹤器
         self.profit_tracker: ProfitTracker = None
@@ -73,9 +83,24 @@ class GridTradingBot:
     def _setup_websocket(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
         """設置 WebSocket 連接監聽訂單成交"""
         try:
-            
+            # 保存憑證用於重連
+            self.ws_credentials = {
+                'account_id': account_id,
+                'orderly_key': orderly_key,
+                'orderly_secret': orderly_secret,
+                'orderly_testnet': orderly_testnet
+            }
+
             def on_close(_):
                 logger.warning("WebSocket 連接已關閉")
+
+                # 如果機器人還在運行且應該重連，則觸發重連
+                if self.is_running and self.ws_should_reconnect:
+                    logger.info("檢測到 WebSocket 意外關閉，準備重連")
+                    # 使用 asyncio 調度重連任務
+                    if self.ws_reconnect_task is None or self.ws_reconnect_task.done():
+                        loop = asyncio.get_event_loop()
+                        self.ws_reconnect_task = loop.create_task(self._handle_ws_reconnect())
 
             def on_error(_, error):
                 """WebSocket 錯誤處理"""
@@ -83,10 +108,23 @@ class GridTradingBot:
                 if "authentication" in str(error).lower() or "auth" in str(error).lower():
                     logger.critical("WebSocket 認證失敗，停止交易")
                     asyncio.create_task(self.stop_grid_trading())
+                    return
+
+                # 其他錯誤觸發重連
+                if self.is_running and self.ws_should_reconnect:
+                    logger.info("WebSocket 錯誤，準備重連")
+                    if self.ws_reconnect_task is None or self.ws_reconnect_task.done():
+                        loop = asyncio.get_event_loop()
+                        self.ws_reconnect_task = loop.create_task(self._handle_ws_reconnect())
 
             def on_message(_, message):
                 """處理 WebSocket 訊息"""
                 try:
+                    # 重置重連計數器（收到消息說明連接正常）
+                    if self.ws_reconnect_attempts > 0:
+                        logger.info("WebSocket 連接恢復正常，重置重連計數器")
+                        self.ws_reconnect_attempts = 0
+
                     data = json.loads(message) if isinstance(message, str) else message
 
                     if (data.get("topic") == "notifications" and
@@ -142,10 +180,117 @@ class GridTradingBot:
                 on_close=on_close,
                 on_error=on_error,
             )
+            logger.info("WebSocket 客戶端初始化成功")
             
         except Exception as e:
             logger.warning(f"設置 WebSocket 連接失敗: {e}")
             self.wss_client = None
+
+    async def _handle_ws_reconnect(self):
+        """
+        處理 WebSocket 重連
+        這個方法會在 WebSocket 斷線時自動調用
+        """
+        try:
+            logger.info("開始 WebSocket 重連流程")
+            
+            # 關閉舊連接
+            if self.wss_client:
+                try:
+                    self._safe_close_ws()
+                except Exception as e:
+                    logger.warning(f"關閉舊 WebSocket 連接時發生錯誤: {e}")
+            
+            # 執行重連
+            success = await self._reconnect_websocket()
+            
+            if success:
+                logger.info("WebSocket 重連成功")
+                metrics.increment_counter("websocket.reconnect.success")
+            else:
+                logger.error("WebSocket 重連失敗，已達最大重試次數")
+                metrics.increment_counter("websocket.reconnect.failed")
+                
+                # 可選：重連失敗後的處理
+                # 1. 繼續運行但不接收 WebSocket 消息
+                # 2. 停止網格交易
+                # 這裡選擇繼續運行（網格訂單仍然有效）
+                logger.warning("WebSocket 重連失敗，機器人將繼續運行但無法接收實時成交通知")
+                
+        except Exception as e:
+            logger.error(f"WebSocket 重連流程異常: {e}")
+
+    async def _reconnect_websocket(self, max_retries: int = None) -> bool:
+        """
+        WebSocket 自動重連
+        
+        Args:
+            max_retries: 最大重試次數（None 使用默認值）
+            
+        Returns:
+            bool: 是否重連成功
+        """
+        if max_retries is None:
+            max_retries = self.WS_RECONNECT_MAX_RETRIES
+        
+        if not self.ws_credentials:
+            logger.error("缺少 WebSocket 憑證，無法重連")
+            return False
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.ws_reconnect_attempts = attempt
+                
+                # 計算退避延遲（指數退避）
+                delay = min(
+                    self.WS_RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                    self.WS_RECONNECT_MAX_DELAY
+                )
+                
+                logger.info(
+                    f"WebSocket 重連嘗試 {attempt}/{max_retries}",
+                    data={"delay": delay}
+                )
+                
+                # 等待後重試
+                if attempt > 1:
+                    await asyncio.sleep(delay)
+                
+                # 重新設置 WebSocket
+                self._setup_websocket(
+                    account_id=self.ws_credentials['account_id'],
+                    orderly_key=self.ws_credentials['orderly_key'],
+                    orderly_secret=self.ws_credentials['orderly_secret'],
+                    orderly_testnet=self.ws_credentials['orderly_testnet']
+                )
+                
+                if not self.wss_client:
+                    raise Exception("WebSocket 客戶端創建失敗")
+                
+                # 訂閱通知
+                self.wss_client.get_notifications()
+                
+                logger.info(f"WebSocket 重連成功（嘗試 {attempt} 次）")
+                
+                # 重置重連計數器
+                self.ws_reconnect_attempts = 0
+                
+                return True
+                
+            except Exception as e:
+                logger.warning(
+                    f"WebSocket 重連失敗 ({attempt}/{max_retries}): {e}",
+                    event_type="websocket_reconnect_failed"
+                )
+                
+                if attempt == max_retries:
+                    logger.error(
+                        f"WebSocket 重連已達最大嘗試次數 ({max_retries})，放棄重連",
+                        event_type="websocket_reconnect_exhausted"
+                    )
+                    return False
+        
+        return False
     
     def _cleanup_old_fills(self):
         """清理過期的成交記錄"""
@@ -571,6 +716,19 @@ class GridTradingBot:
 
         except Exception as e:
             logger.error(f"處理停止訊號失敗: {e}")
+
+    async def _reconnect_websocket(self, max_retries=5):
+        """WebSocket 自動重連"""
+        for attempt in range(max_retries):
+            try:
+                self._setup_websocket(...)
+                self.wss_client.get_notifications()
+                logger.info("WebSocket 重連成功")
+                return True
+            except Exception as e:
+                logger.warning(f"WebSocket 重連失敗 ({attempt+1}/{max_retries}): {e}")
+                await asyncio.sleep(2 ** attempt)
+        return False
     
     async def start_grid_trading(self, config: Dict[str, Any]):
         """啟動網格交易（整合利潤追蹤）"""
@@ -612,6 +770,18 @@ class GridTradingBot:
             )
             await self.event_queue.start()
             
+            # 設置 WebSocket 連接
+            self._setup_websocket(
+                account_id=config['orderly_account_id'],
+                orderly_key=config['orderly_key'],
+                orderly_secret=config['orderly_secret'],
+                orderly_testnet=config['orderly_testnet']
+            )
+
+            # 啟用 WebSocket 重連
+            self.ws_should_reconnect = True
+            self.ws_reconnect_attempts = 0
+
             # 設置 WebSocket 連接
             self._setup_websocket(
                 account_id=config['orderly_account_id'],
@@ -668,6 +838,17 @@ class GridTradingBot:
         """停止網格交易"""
         logger.info("停止網格交易機器人")
         
+        # 禁用 WebSocket 重連
+        self.ws_should_reconnect = False
+
+        # 取消正在進行的重連任務
+        if self.ws_reconnect_task and not self.ws_reconnect_task.done():
+            self.ws_reconnect_task.cancel()
+            try:
+                await self.ws_reconnect_task
+            except asyncio.CancelledError:
+                logger.info("WebSocket 重連任務已取消")
+
         if self.signal_generator:
             self.signal_generator.stop_by_signal()
         
@@ -693,7 +874,15 @@ class GridTradingBot:
             "active_orders": self.active_orders,
             "grid_orders": self.grid_orders,
             "order_statistics": self.order_tracker.get_statistics(),
-            "event_queue_size": self.event_queue.get_queue_size() if self.event_queue else 0
+            "event_queue_size": self.event_queue.get_queue_size() if self.event_queue else 0,
+
+            # WebSocket 狀態
+            "websocket": {
+                "connected": self.wss_client is not None,
+                "should_reconnect": self.ws_should_reconnect,
+                "reconnect_attempts": self.ws_reconnect_attempts,
+                "reconnecting": self.ws_reconnect_task is not None and not self.ws_reconnect_task.done()
+            }
         }
         
         # ⭐ 新增：包含利潤統計
