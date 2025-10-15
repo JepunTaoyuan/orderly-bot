@@ -57,8 +57,11 @@ class ErrorCode(Enum):
     # 用戶管理錯誤 (7000-7999)
     USER_ALREADY_EXISTS = "E7000"
     USER_NOT_FOUND = "E7001"
-    USER_CREATION_FAILED = "E7002"
+    USER_API_KEY_PAIR_UPDATE_FAILED = "E7002"
     USER_UPDATE_FAILED = "E7003"
+    USER_API_KEY_PAIR_NOT_FOUND = "E7004"
+    USER_API_KEY_PAIR_CHECK_FAILED = "E7005"
+    USER_CREATION_FAILED = "E7006"
 
     # 斷路器錯誤 (8000-8999)
     CIRCUIT_BREAKER_OPEN = "E8000"
@@ -270,6 +273,20 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         description="The service is temporarily unavailable due to repeated failures",
         http_status=503,
         user_message="服務暫時不可用，請稍後重試"
+    ),
+    ErrorCode.USER_API_KEY_PAIR_NOT_FOUND: ErrorDetail(
+        code=ErrorCode.USER_API_KEY_PAIR_NOT_FOUND,
+        message="User API key pair not found",
+        description="The requested API key pair does not exist",
+        http_status=404,
+        user_message="找不到指定的用戶API密鑰對"
+    ),
+    ErrorCode.USER_API_KEY_PAIR_CHECK_FAILED: ErrorDetail(
+        code=ErrorCode.USER_API_KEY_PAIR_CHECK_FAILED,
+        message="Failed to check user API key pair",
+        description="Failed to verify the API key pair for the user",
+        http_status=500,
+        user_message="檢查用戶API密鑰失敗"
     ),
 }
 

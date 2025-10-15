@@ -2,6 +2,7 @@
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from typing import Optional, Dict, Any
 from src.utils.logging_config import get_logger
+from src.utils.error_codes import ErrorCode, GridTradingException
 
 logger = get_logger("mongo_manager")
 
@@ -32,32 +33,35 @@ class MongoManager:
             self._initialized = True
             logger.info("MongoDB 連接已初始化")
 
-    async def create_user(self, user_id: str, api_key: str, api_secret: str,
-                         user_wallet_address: str) -> Any:
+    async def update_user_api_key_pair(self, user_id: str, api_key: str, api_secret: str) -> Any:
         """
-        創建用戶
+        更新用戶API密鑰對
 
         Args:
             user_id: 用戶ID
             api_key: API密鑰
             api_secret: API密碼
-            user_wallet_address: 錢包地址
 
         Returns:
-            插入結果
+            更新結果
         """
         try:
-            result = await self.users.insert_one({
-                "_id": user_id,
-                "api_key": api_key,
-                "api_secret": api_secret,
-                "wallet_address": user_wallet_address,
-            })
-            logger.info(f"用戶創建成功: {user_id}")
+            result = await self.users.update_one(
+                {"_id": user_id},
+                {"$set": {
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                }}
+            )
+            logger.info(f"用戶更新api key pair成功: {user_id}")
             return result
         except Exception as e:
-            logger.error(f"創建用戶失敗: {e}")
-            raise
+            logger.error(f"更新用戶api key pair失敗: {e}")
+            raise GridTradingException(
+                error_code=ErrorCode.USER_API_KEY_PAIR_UPDATE_FAILED,
+                details={"user_id": user_id},
+                original_error=e
+            )
 
     async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -78,27 +82,22 @@ class MongoManager:
             logger.error(f"獲取用戶失敗: {e}")
             return None
 
-    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> Any:
+    async def check_user_api_key_exist(self, user_id: str) -> bool:
         """
-        更新用戶信息
+        檢查用戶API密鑰是否存在
 
         Args:
             user_id: 用戶ID
-            updates: 更新的欄位
 
         Returns:
-            更新結果
+            是否存在API密鑰對
         """
         try:
-            result = await self.users.update_one(
-                {"_id": user_id},
-                {"$set": updates}
-            )
-            logger.info(f"用戶更新成功: {user_id}")
-            return result
+            user = await self.users.find_one({"_id": user_id})
+            return bool(user and user.get("api_key") and user.get("api_secret"))
         except Exception as e:
-            logger.error(f"更新用戶失敗: {e}")
-            raise
+            logger.error(f"檢查用戶api key pair是否存在失敗: {e}")
+            return False
 
     async def close(self):
         """關閉連接"""
