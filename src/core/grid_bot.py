@@ -127,44 +127,60 @@ class GridTradingBot:
 
                     data = json.loads(message) if isinstance(message, str) else message
 
-                    if (data.get("topic") == "notifications" and
-                        data.get("data", {}).get("messageType") == "ORDER_FILLED"):
+                    # 兼容不同的通知內容格式（contentRaw 或 content）
+                    if data.get("topic") == "notifications":
+                        payload = data.get("data", {})
+                        msg_type = payload.get("messageType")
+                        if msg_type == "ORDER_FILLED":
+                            content = payload.get("contentRaw") or payload.get("content")
+                            content_json = {}
+                            if isinstance(content, str):
+                                try:
+                                    content_json = json.loads(content)
+                                except Exception:
+                                    content_json = {}
+                            elif isinstance(content, dict):
+                                content_json = content
 
-                        content_raw = data["data"]["contentRaw"]
+                            order_id = content_json.get("orderId") or payload.get("orderId") or data.get("orderId")
+                            executed_price = content_json.get("executedPrice")
+                            executed_quantity = content_json.get("executedQuantity")
+                            side = content_json.get("side")
+                            symbol = (content_json.get("symbol") or "")
+                            executed_timestamp = content_json.get("executedTimestamp", 0)
 
-                        order_id = content_raw["orderId"]
-                        executed_price = content_raw["executedPrice"]
-                        executed_quantity = content_raw["executedQuantity"]
-                        side = content_raw["side"]
-                        symbol = content_raw.get("symbol", "")
-                        executed_timestamp = content_raw.get("executedTimestamp", 0)
+                            if order_id is None:
+                                logger.warning(f"ORDER_FILLED 通知缺少 orderId，原始資料: {data}")
+                                return
 
-                        fill_id = f"{order_id}_{executed_price}_{executed_quantity}_{executed_timestamp}"
+                            fill_id = f"{order_id}_{executed_price}_{executed_quantity}_{executed_timestamp}"
 
-                        logger.info("訂單成交", event_type="order_filled", data={
-                            "order_id": order_id,
-                            "symbol": symbol,
-                            "price": executed_price,
-                            "quantity": executed_quantity,
-                            "side": side,
-                            "timestamp": executed_timestamp,
-                            "fill_id": fill_id
-                        })
-
-                        metrics.increment_counter("orders.filled", tags={"side": side})
-                        metrics.record_histogram("order.fill_price", float(executed_price))
-                        metrics.record_histogram("order.fill_quantity", float(executed_quantity))
-
-                        if self.event_queue:
-                            fill_data = {
+                            logger.info("訂單成交", event_type="order_filled", data={
                                 "order_id": order_id,
-                                "executed_price": executed_price,
-                                "executed_quantity": executed_quantity,
+                                "symbol": symbol,
+                                "price": executed_price,
+                                "quantity": executed_quantity,
                                 "side": side,
+                                "timestamp": executed_timestamp,
                                 "fill_id": fill_id
-                            }
-                            event = Event(EventType.ORDER_FILLED, fill_data)
-                            asyncio.create_task(self.event_queue.add_event(event))
+                            })
+
+                            metrics.increment_counter("orders.filled", tags={"side": side})
+                            if executed_price is not None:
+                                metrics.record_histogram("order.fill_price", float(executed_price))
+                            if executed_quantity is not None:
+                                metrics.record_histogram("order.fill_quantity", float(executed_quantity))
+
+                            if self.event_queue:
+                                fill_data = {
+                                    "order_id": order_id,
+                                    "executed_price": executed_price,
+                                    "executed_quantity": executed_quantity,
+                                    "side": side,
+                                    "fill_id": fill_id
+                                }
+                                event = Event(EventType.ORDER_FILLED, fill_data)
+                                asyncio.create_task(self.event_queue.add_event(event))
                         
                 except Exception as e:
                     logger.error(f"處理 WebSocket 訊息失敗: {e}")
@@ -267,7 +283,11 @@ class GridTradingBot:
                 if not self.wss_client:
                     raise Exception("WebSocket 客戶端創建失敗")
                 
-                # 訂閱通知
+                # 啟動連線並訂閱通知
+                if hasattr(self.wss_client, "run"):
+                    await self.wss_client.run()
+                else:
+                    logger.warning("WebSocket 客戶端缺少 run()，可能無法啟動連線")
                 self.wss_client.get_notifications()
                 
                 logger.info(f"WebSocket 重連成功（嘗試 {attempt} 次）")
@@ -401,10 +421,35 @@ class GridTradingBot:
                             del self.active_orders[order_id]
                         if grid_price in self.grid_orders:
                             del self.grid_orders[grid_price]
-                
-                # 通知訊號生成器處理成交
-                if self.signal_generator:
-                    self.signal_generator.on_order_filled(filled_signal)
+
+                    # 僅在完全成交時，通知訊號生成器處理下一步（取消與掛相鄰格）
+                    if self.signal_generator:
+                        self.signal_generator.on_order_filled(filled_signal)
+                else:
+                    # 部分成交時不觸發下一步，僅記錄進度
+                    try:
+                        if order_info:
+                            progress = order_info.get_fill_percentage()
+                            logger.info(
+                                "部分成交，暫不觸發下一格下單",
+                                event_type="order_partial",
+                                data={
+                                    "order_id": order_id,
+                                    "filled": str(order_info.filled_quantity),
+                                    "original": str(order_info.original_quantity),
+                                    "remaining": str(order_info.remaining_quantity),
+                                    "progress_pct": f"{progress:.2f}"
+                                }
+                            )
+                        else:
+                            logger.info(
+                                "部分成交，暫不觸發下一格下單",
+                                event_type="order_partial",
+                                data={"order_id": order_id}
+                            )
+                    except Exception:
+                        # 保守處理：日誌不可影響流程
+                        logger.debug("記錄部分成交進度失敗，忽略")
                 
         except Exception as e:
             logger.error(f"處理訂單成交失敗: {e}")
@@ -717,18 +762,7 @@ class GridTradingBot:
         except Exception as e:
             logger.error(f"處理停止訊號失敗: {e}")
 
-    async def _reconnect_websocket(self, max_retries=5):
-        """WebSocket 自動重連"""
-        for attempt in range(max_retries):
-            try:
-                self._setup_websocket(...)
-                self.wss_client.get_notifications()
-                logger.info("WebSocket 重連成功")
-                return True
-            except Exception as e:
-                logger.warning(f"WebSocket 重連失敗 ({attempt+1}/{max_retries}): {e}")
-                await asyncio.sleep(2 ** attempt)
-        return False
+    # （已移除舊版占位符重連方法，避免覆蓋正確實作）
     
     async def start_grid_trading(self, config: Dict[str, Any]):
         """啟動網格交易（整合利潤追蹤）"""
@@ -781,21 +815,17 @@ class GridTradingBot:
             # 啟用 WebSocket 重連
             self.ws_should_reconnect = True
             self.ws_reconnect_attempts = 0
-
-            # 設置 WebSocket 連接
-            self._setup_websocket(
-                account_id=config['orderly_account_id'],
-                orderly_key=config['orderly_key'],
-                orderly_secret=config['orderly_secret'],
-                orderly_testnet=config['orderly_testnet']
-            )
             
-            # 啟動 WebSocket 監聽
+            # 啟動 WebSocket 連線並監聽
             try:
+                if hasattr(self.wss_client, "run"):
+                    await self.wss_client.run()
+                else:
+                    logger.warning("WebSocket 客戶端缺少 run()，可能無法啟動連線")
                 self.wss_client.get_notifications()
-                logger.info("WebSocket 訂閱 notifications 成功")
+                logger.info("WebSocket 啟動並訂閱 notifications 成功")
             except Exception as e:
-                logger.error(f"WebSocket 訂閱 notifications 失敗: {e}")
+                logger.error(f"WebSocket 啟動或訂閱 notifications 失敗: {e}")
             
             # 創建訊號生成器（⭐ 使用新的固定數量版本）
             self.signal_generator = GridSignalGenerator(

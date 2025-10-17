@@ -98,7 +98,8 @@ class CircuitBreaker:
                     self.state = "OPEN"
                     logger.error(
                         f"斷路器開啟: {func.__name__}",
-                        extra={"failure_count": self.failure_count}
+                        event_type="circuit_breaker_open",
+                        data={"failure_count": self.failure_count}
                     )
 
                 raise
@@ -229,7 +230,8 @@ def retry(
                     if attempt == config.max_attempts:
                         logger.error(
                             f"達到最大重試次數 ({config.max_attempts})，放棄重試",
-                            extra={
+                            event_type="retry_exhausted",
+                            data={
                                 "function": func.__name__,
                                 "attempt": attempt,
                                 "error": str(e)
@@ -241,7 +243,8 @@ def retry(
                     if not RetryHandler.is_retryable_exception(e, config):
                         logger.warning(
                             f"異常不可重試，直接拋出",
-                            extra={
+                            event_type="non_retryable_exception",
+                            data={
                                 "function": func.__name__,
                                 "error": str(e)
                             }
@@ -261,7 +264,8 @@ def retry(
                     # 記錄重試
                     logger.warning(
                         f"第 {attempt} 次嘗試失敗，{delay:.2f}秒後重試",
-                        extra={
+                        event_type="retry_attempt_failed",
+                        data={
                             "function": func.__name__,
                             "attempt": attempt,
                             "max_attempts": config.max_attempts,

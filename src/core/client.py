@@ -8,6 +8,7 @@ Orderly 交易客戶端
 from orderly_evm_connector.rest import RestAsync 
 from typing import Dict, Any, Optional
 import asyncio
+import time
 from src.utils.retry_handler import RetryHandler, RetryConfig
 from src.utils.logging_config import get_logger
 from src.utils.api_helpers import with_orderly_api_handling
@@ -46,6 +47,8 @@ class OrderlyClient:
         Returns:
             訂單響應
         """
+        # 等待0.02秒，避免頻繁創建訂單
+        await asyncio.sleep(0.02)
         return await self.client.create_order(
             symbol=symbol,
             order_type="LIMIT",

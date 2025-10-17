@@ -32,6 +32,7 @@ grid_ratio: 比例參數，建議範圍 0.01-0.1
 
 import math
 import asyncio
+import time
 import inspect
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional, Callable
@@ -173,16 +174,16 @@ class GridSignalGenerator:
         for i in range(1, self.grid_levels_below + 1):
             price = self.current_price - i * self.price_below
             if price >= self.lower_bound:
-                prices.append(price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                prices.append(price.quantize(Decimal('0.00001'), rounding=ROUND_HALF_UP))
         
         # 按價格從低到高排序
         prices.sort()
         
         # 再計算上方的網格價格（不包含 current_price）
         for i in range(1, self.grid_levels_above + 1):
-            price = self.current_price + i * self.price_above
+            price = self.current_price + i * self.price_below
             if price <= self.upper_bound:
-                prices.append(price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                prices.append(price.quantize(Decimal('0.00001'), rounding=ROUND_HALF_UP))
         
         return prices
     
@@ -239,32 +240,39 @@ class GridSignalGenerator:
         """
         self.initial_margin = self.total_margin / Decimal('2')
         self.grid_margin = self.total_margin / Decimal('2')
-        
+
         # 計算初始倉位大小
         self.initial_position_size = (
             self.initial_margin / self.current_price
-        ).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
-        
+        ).quantize(Decimal('1.000000'), rounding=ROUND_HALF_UP)
+
         # 計算下方網格
         lower_grids = [p for p in self.grid_prices if p < self.current_price]
-        
+
+        # 初始化變量
+        reference_price = None
+        margin_per_grid = None
+        num_grids = 0
+
         if lower_grids:
             if self.grid_type == GridType.ARITHMETIC:
                 # ⭐ 用最低價計算（確保在最低價時保證金也夠用）
                 reference_price = min(lower_grids)
                 num_grids = len(lower_grids)
                 margin_per_grid = self.grid_margin / Decimal(str(num_grids))
-                
+
                 # 固定數量 = 每格保證金 / 參考價格
                 self.quantity_per_grid = (
                     margin_per_grid / reference_price
-                ).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+                ).quantize(Decimal('1.000000'), rounding=ROUND_HALF_UP)
             else:  # GEOMETRIC
                 # 等比網格：只需要記錄每格保證金，數量動態計算
                 num_grids = len(lower_grids)
                 self.margin_per_grid = self.grid_margin / Decimal(str(num_grids))
                 self.quantity_per_grid = Decimal('0')  # 不使用固定數量
-            
+                reference_price = min(lower_grids)  # 用於日誌記錄
+                margin_per_grid = self.margin_per_grid
+
             logger.info(
                 "做多網格設置完成",
                 event_type="grid_setup_long",
@@ -272,17 +280,20 @@ class GridSignalGenerator:
                     "總保證金": str(self.total_margin),
                     "初始倉位": f"{self.initial_position_size} BTC ({self.initial_margin} USDT @ {self.current_price})",
                     "網格保證金": str(self.grid_margin),
-                    "參考價格(最低價)": str(reference_price),
+                    "參考價格(最低價)": str(reference_price) if reference_price else None,
                     "下方網格數": num_grids,
                     "每格固定數量": f"{self.quantity_per_grid} BTC",
-                    "每格保證金(約)": str(margin_per_grid),
+                    "每格保證金(約)": str(margin_per_grid) if margin_per_grid else None,
                 }
             )
         else:
             # 沒有下方網格的備用方案
+            num_grids = self.grid_levels
+            margin_per_grid = self.grid_margin / Decimal(str(num_grids))
             self.quantity_per_grid = (
-                self.grid_margin / Decimal(str(self.grid_levels)) / self.current_price
-            ).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+                margin_per_grid / self.current_price
+            ).quantize(Decimal('1.000000'), rounding=ROUND_HALF_UP)
+            reference_price = self.current_price  # 用於日誌記錄
             logger.warning("沒有下方網格，使用當前價格計算")
     
     def _setup_short_grid(self):
@@ -379,12 +390,12 @@ class GridSignalGenerator:
             # 等比網格：固定投資金額，數量隨價格變化
             if price is None:
                 raise ValueError("等比網格計算倉位大小時必須提供價格")
-            
+
             # 使用初始化時計算的每格保證金
             quantity = (self.margin_per_grid / price).quantize(
                 Decimal('0.000001'), rounding=ROUND_HALF_UP
-        )
-        
+            )
+
         return quantity
     
     def _emit_signal(self, side: OrderSide, price: Decimal, size: Decimal, signal_type: str) -> TradingSignal:
@@ -555,6 +566,7 @@ class GridSignalGenerator:
                     # 上方掛賣單（減倉）
                     signal = self._emit_signal(OrderSide.SELL, price, position_size, "INITIAL")
                     logger.info("掛賣單（減倉）", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
+                time.sleep(0.1)
                     
         elif self.direction == Direction.SHORT:
             # 做空策略：
@@ -575,24 +587,23 @@ class GridSignalGenerator:
                     # 上方掛賣單（加倉）
                     signal = self._emit_signal(OrderSide.SELL, price, position_size, "INITIAL")
                     logger.info("掛賣單（加倉）", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
+                time.sleep(0.1)
                     
         elif self.direction == Direction.BOTH:
-            # 雙向策略：掛 current_price 上下各一格的買賣單
-            center_idx = self.center_index
-            
-            # 掛下方一格的買單
-            if center_idx > 0:
-                buy_price = self.grid_prices[center_idx - 1]
-                buy_size = self._calculate_position_size(buy_price)  # ⭐ 根據網格類型計算數量
-                buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "INITIAL")
-                logger.info("掛買單", event_type="grid_order_initial", data={"price": str(buy_price), "size": str(buy_size)})
-            
-            # 掛上方一格的賣單
-            if center_idx < len(self.grid_prices) - 1:
-                sell_price = self.grid_prices[center_idx + 1]
-                sell_size = self._calculate_position_size(sell_price)  # ⭐ 根據網格類型計算數量
-                sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "INITIAL")
-                logger.info("掛賣單", event_type="grid_order_initial", data={"price": str(sell_price), "size": str(sell_size)})
+            # 雙向策略：一次性開啟所有格線的限價單
+            for i, price in enumerate(self.grid_prices):
+                position_size = self._calculate_position_size(price)  # ⭐ 根據網格類型計算數量
+                
+                if price < self.current_price:
+                    # 下方掛買單
+                    signal = self._emit_signal(OrderSide.BUY, price, position_size, "INITIAL")
+                    logger.info("掛買單", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
+                elif price > self.current_price:
+                    # 上方掛賣單
+                    signal = self._emit_signal(OrderSide.SELL, price, position_size, "INITIAL")
+                    logger.info("掛賣單", event_type="grid_order_initial", data={"price": str(price), "size": str(position_size)})
+                
+                time.sleep(0.1)  # 避免過度請求
         
         logger.info("初始網格設置完成", event_type="grid_setup_done")
     
@@ -617,18 +628,10 @@ class GridSignalGenerator:
             logger.info("第一次觸發網格", event_type="grid_first_trigger", data={"current_pointer": self.current_pointer})
         else:
             # 更新 current_pointer 到成交的格子
+            # 根據成交方向和相對位置開單
+            self._generate_counter_signal(filled_signal)
             self.current_pointer = filled_index
             logger.info("更新 current_pointer", event_type="grid_pointer_update", data={"current_pointer": self.current_pointer})
-        
-        # 取消所有掛單（這裡只是發出取消訊號，實際取消由交易系統處理）
-        logger.info("發出取消所有掛單的訊號", event_type="grid_cancel_all")
-        cancel_signal = TradingSignal(
-            symbol=self.ticker,
-            side=OrderSide.BUY,  # 取消訊號的方向不重要
-            price=Decimal('0'),
-            size=Decimal('0'),
-            signal_type="CANCEL_ALL"
-        )
         
         if self.signal_callback:
             try:
@@ -636,13 +639,12 @@ class GridSignalGenerator:
                     asyncio.create_task(self.signal_callback(cancel_signal))
                 else:
                     result = self.signal_callback(cancel_signal)
+                    # 若回調回傳 coroutine，也以非阻塞方式派發
                     if inspect.iscoroutine(result):
                         asyncio.create_task(result)
             except Exception as _:
+                # 回調失敗不影響訊號生成（MVP 允許忽略）
                 pass
-        
-        # 生成新的掛單訊號
-        self._generate_counter_signal(filled_signal)
     
     def _generate_counter_signal(self, filled_signal: TradingSignal):
         """根據 current_pointer 和成交方向掛相鄰格子的單"""
@@ -652,16 +654,16 @@ class GridSignalGenerator:
         
         try:
             current_idx = self.current_pointer
-            logger.info("生成相鄰格子的掛單", event_type="grid_counter_setup", data={"current_pointer": current_idx, "filled_side": filled_signal.side.value})
+            logger.info("生成前次位置的掛單", event_type="grid_counter_setup", data={"last_pointer": current_idx, "filled_side": filled_signal.side.value})
             
             if self.direction == Direction.LONG:
                 # 做多策略：
                 # - 買單成交（價格下跌，加倉） → 掛上方賣單（減倉）
                 # - 賣單成交（價格上漲，減倉） → 掛下方買單（加倉）
                 if filled_signal.side == OrderSide.BUY:
-                    # 買單成交，掛上方賣單
+                    # 買單成交，掛前次位置的賣單（減倉）
                     if current_idx < len(self.grid_prices) - 1:
-                        sell_idx = current_idx + 1
+                        sell_idx = current_idx
                         sell_price = self.grid_prices[sell_idx]
                         sell_size = self._calculate_position_size(sell_price)  # ⭐ 根據網格類型計算數量
                         sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "COUNTER")
@@ -671,7 +673,7 @@ class GridSignalGenerator:
                 else:  # 賣單成交
                     # 賣單成交，掛下方買單
                     if current_idx > 0:
-                        buy_idx = current_idx - 1
+                        buy_idx = current_idx
                         buy_price = self.grid_prices[buy_idx]
                         buy_size = self._calculate_position_size(buy_price)  # ⭐ 根據網格類型計算數量
                         buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "COUNTER")
@@ -684,9 +686,9 @@ class GridSignalGenerator:
                 # - 賣單成交（價格上漲，加倉） → 掛下方買單（減倉平倉）
                 # - 買單成交（價格下跌，減倉） → 掛上方賣單（加倉）
                 if filled_signal.side == OrderSide.SELL:
-                    # 賣單成交，掛下方買單
+                    # 賣單成交，掛前次位置的買單（平倉）
                     if current_idx > 0:
-                        buy_idx = current_idx - 1
+                        buy_idx = current_idx
                         buy_price = self.grid_prices[buy_idx]
                         buy_size = self._calculate_position_size(buy_price)  # ⭐ 根據網格類型計算數量
                         buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "COUNTER")
@@ -694,9 +696,9 @@ class GridSignalGenerator:
                     else:
                         logger.warning("已到達網格下界，無法掛買單")
                 else:  # 買單成交
-                    # 買單成交，掛上方賣單
+                    # 買單成交，掛前次位置的賣單（加倉）
                     if current_idx < len(self.grid_prices) - 1:
-                        sell_idx = current_idx + 1
+                        sell_idx = current_idx
                         sell_price = self.grid_prices[sell_idx]
                         sell_size = self._calculate_position_size(sell_price)  # ⭐ 根據網格類型計算數量
                         sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "COUNTER")
@@ -707,9 +709,9 @@ class GridSignalGenerator:
             elif self.direction == Direction.BOTH:
                 # 雙向策略：掛上下相鄰格子的單
                 
-                # 掛下方的買單
+                # 掛前次位置的買單
                 if current_idx > 0:
-                    buy_idx = current_idx - 1
+                    buy_idx = current_idx   
                     buy_price = self.grid_prices[buy_idx]
                     buy_size = self._calculate_position_size(buy_price)  # ⭐ 根據網格類型計算數量
                     buy_signal = self._emit_signal(OrderSide.BUY, buy_price, buy_size, "COUNTER")
@@ -717,9 +719,9 @@ class GridSignalGenerator:
                 else:
                     logger.warning("已到達網格下界，無法掛買單")
                 
-                # 掛上方的賣單
+                # 掛前次位置的賣單
                 if current_idx < len(self.grid_prices) - 1:
-                    sell_idx = current_idx + 1
+                    sell_idx = current_idx   
                     sell_price = self.grid_prices[sell_idx]
                     sell_size = self._calculate_position_size(sell_price)  # ⭐ 根據網格類型計算數量
                     sell_signal = self._emit_signal(OrderSide.SELL, sell_price, sell_size, "COUNTER")

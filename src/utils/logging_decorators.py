@@ -57,7 +57,7 @@ def log_execution(
             start_time = time.time()
 
             try:
-                logger_instance.info(f"開始執行: {func_name}", extra=log_data)
+                logger_instance.info(f"開始執行: {func_name}", event_type=event_type, data=log_data)
 
                 # 執行函數
                 result = await func(*args, **kwargs)
@@ -74,7 +74,8 @@ def log_execution(
 
                 logger_instance.info(
                     f"執行成功: {func_name} (耗時: {elapsed:.3f}s)",
-                    extra=log_data
+                    event_type=event_type,
+                    data=log_data
                 )
 
                 return result
@@ -90,7 +91,8 @@ def log_execution(
 
                 logger_instance.error(
                     f"執行失敗(自定義異常): {func_name} - {e.error_detail.message}",
-                    extra=log_data
+                    event_type=event_type,
+                    data=log_data
                 )
                 raise
 
@@ -108,8 +110,8 @@ def log_execution(
 
                 logger_instance.error(
                     f"執行失敗: {func_name} - {str(e)}",
-                    extra=log_data,
-                    exc_info=log_exception
+                    event_type=event_type,
+                    data=log_data
                 )
                 raise
 
@@ -139,7 +141,11 @@ def log_execution(
             start_time = time.time()
 
             try:
-                logger_instance.info(f"開始執行: {func_name}", extra=log_data)
+                logger_instance.info(
+                    f"開始執行: {func_name}",
+                    event_type=event_type,
+                    data=log_data
+                )
 
                 # 執行函數
                 result = func(*args, **kwargs)
@@ -156,7 +162,8 @@ def log_execution(
 
                 logger_instance.info(
                     f"執行成功: {func_name} (耗時: {elapsed:.3f}s)",
-                    extra=log_data
+                    event_type=event_type,
+                    data=log_data
                 )
 
                 return result
@@ -175,8 +182,8 @@ def log_execution(
 
                 logger_instance.error(
                     f"執行失敗: {func_name} - {str(e)}",
-                    extra=log_data,
-                    exc_info=log_exception
+                    event_type=event_type,
+                    data=log_data
                 )
                 raise
 
@@ -242,7 +249,8 @@ def log_api_call(
             try:
                 logger_instance.info(
                     f"API調用開始: {request.method if request else 'Unknown'} {request.url.path if request else func.__name__}",
-                    extra=log_data
+                    event_type="api_call_start",
+                    data=log_data
                 )
 
                 # 執行函數
@@ -258,7 +266,8 @@ def log_api_call(
 
                 logger_instance.info(
                     f"API調用成功: {request.method if request else 'Unknown'} {request.url.path if request else func.__name__} (耗時: {elapsed:.3f}s)",
-                    extra=log_data
+                    event_type="api_call_success",
+                    data=log_data
                 )
 
                 return result
@@ -273,7 +282,8 @@ def log_api_call(
 
                 logger_instance.error(
                     f"API調用失敗: {request.method if request else 'Unknown'} {request.url.path if request else func.__name__}",
-                    extra=log_data
+                    event_type="api_call_error",
+                    data=log_data
                 )
                 raise
 
@@ -304,7 +314,8 @@ def log_performance(
             if elapsed_ms > threshold_ms:
                 logger_instance.warning(
                     f"性能警告: {func.__name__} 執行時間過長",
-                    extra={
+                    event_type="performance_warning",
+                    data={
                         "function": func.__name__,
                         "duration_ms": round(elapsed_ms, 2),
                         "threshold_ms": threshold_ms
@@ -324,7 +335,8 @@ def log_performance(
             if elapsed_ms > threshold_ms:
                 logger_instance.warning(
                     f"性能警告: {func.__name__} 執行時間過長",
-                    extra={
+                    event_type="performance_warning",
+                    data={
                         "function": func.__name__,
                         "duration_ms": round(elapsed_ms, 2),
                         "threshold_ms": threshold_ms

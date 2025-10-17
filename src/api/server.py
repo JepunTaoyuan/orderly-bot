@@ -188,6 +188,9 @@ async def enable_bot_trading(request: Request, config: RegisterConfig):
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": config.user_id}
             )  
+        
+        config.user_api_key = "ed25519:" + config.user_api_key
+        config.user_api_secret = "ed25519:" + config.user_api_secret
 
         # 更新用戶API密鑰對
         result = await mongo_manager.update_user_api_key_pair(
@@ -250,7 +253,7 @@ async def check_user_api_key(request: Request, user_id: str):
 class StartConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "ticker": "BTCUSDT",
+            "ticker": "PERP_ETH_USDC",
             "direction": "BOTH",
             "current_price": 42500,
             "upper_bound": 45000,
@@ -268,7 +271,10 @@ class StartConfig(BaseModel):
         }
     })
 
-    ticker: str = Field(..., pattern=r"^[A-Z]+USDT$")
+    ticker: str = Field(
+        ..., 
+        pattern=r"^PERP_[A-Z]+_USDC$"
+    )
     direction: str = Field(..., pattern="^(LONG|SHORT|BOTH)$")
     current_price: float = Field(..., gt=0)
     upper_bound: float = Field(..., gt=0)
@@ -349,8 +355,11 @@ async def start_grid(request: Request, config: StartConfig):
         config.timestamp,
         config.nonce
     ) as auth_result:
-        logger.info(f"用戶 {config.user_id} 簽名驗證成功",
-                   extra={"wallet_type": auth_result["wallet_type"]})
+        logger.info(
+            f"用戶 {config.user_id} 簽名驗證成功",
+            event_type="wallet_signature_verified",
+            data={"wallet_type": auth_result["wallet_type"]}
+        )
 
     session_id = create_session_id(config.user_id, config.ticker)
     
@@ -402,7 +411,7 @@ async def start_grid(request: Request, config: StartConfig):
 class StopConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "session_id": "user123_BTCUSDT",
+            "session_id": "user123_PERP_ETH_USDC",
             "user_sig": "user123",
             "timestamp": 1234567890,
             "nonce": "random_nonce"
@@ -421,13 +430,14 @@ async def stop_grid(request: Request, config: StopConfig):
     session_id = validate_session_id(config.session_id)
 
     # 解析 user_id
-    parts = session_id.split('_')
-    if len(parts) < 2:
+    try:
+        # 支持 ticker 中包含下劃線，僅按第一個下劃線拆分
+        user_id, _ = session_id.split('_', 1)
+    except ValueError:
         raise GridTradingException(
             error_code=ErrorCode.INVALID_SESSION_ID,
             details={"session_id": session_id}
         )
-    user_id = parts[-2]
 
     # 使用統一的簽名驗證
     async with WalletAuthContext(
@@ -436,8 +446,11 @@ async def stop_grid(request: Request, config: StopConfig):
         config.timestamp,
         config.nonce
     ) as auth_result:
-        logger.info(f"用戶 {user_id} 簽名驗證成功",
-                   extra={"wallet_type": auth_result["wallet_type"]})
+        logger.info(
+            f"用戶 {user_id} 簽名驗證成功",
+            event_type="wallet_verified",
+            data={"wallet_type": auth_result["wallet_type"]}
+        )
 
     with SessionContextManager(session_id):
         try:

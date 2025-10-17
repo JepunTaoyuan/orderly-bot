@@ -148,8 +148,11 @@ class MarketValidator:
         if grid_levels < 2:
             raise ValidationError("網格數量必須至少為2")
         
-        # 驗證總金額
-        total_amount = Decimal(str(config.get("total_amount", 0)))
+        # 驗證總金額（兼容別名 total_margin）
+        total_amount_input = config.get("total_amount")
+        if total_amount_input is None:
+            total_amount_input = config.get("total_margin")
+        total_amount = Decimal(str(total_amount_input or 0))
         if total_amount <= 0:
             raise ValidationError("總投入金額必須大於0")
         

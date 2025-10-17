@@ -20,7 +20,11 @@ class GridConfigValidator(BaseModel):
 
     # 基本配置
     user_id: str = Field(..., min_length=1, description="用戶ID")
-    ticker: str = Field(..., pattern=r"^[A-Z]+USDT$", description="交易對")
+    ticker: str = Field(
+        ..., 
+        pattern=r"^PERP_[A-Z]+_USDC$",
+        description="交易對 (僅支持 PERP_{ticker}_USDC，如 PERP_ETH_USDC)"
+    )
     direction: Direction = Field(..., description="交易方向")
     current_price: float = Field(..., gt=0, description="當前價格")
     upper_bound: float = Field(..., gt=0, description="價格上界")
@@ -84,8 +88,15 @@ class GridConfigValidator(BaseModel):
     @field_validator('ticker')
     def validate_ticker(cls, v):
         """驗證交易對格式"""
-        if not v.endswith('USDT'):
-            raise ValueError("目前只支持 USDT 交易對")
+        # 僅接受 PERP_{ticker}_USDC 形式，如 PERP_ETH_USDC
+        if not (v.startswith('PERP_') and v.endswith('_USDC')):
+            raise ValueError("目前只支持 PERP_{ticker}_USDC 形式，如 PERP_ETH_USDC")
+        parts = v.split('_')
+        if len(parts) != 3 or parts[0] != 'PERP' or parts[2] != 'USDC':
+            raise ValueError("symbol 格式需為 PERP_{ticker}_USDC")
+        ticker = parts[1]
+        if not ticker.isalpha() or not ticker.isupper():
+            raise ValueError("ticker 必須為大寫英文字母，例如 ETH、BTC、SOL")
         return v
 
     @model_validator(mode='after')
@@ -255,6 +266,8 @@ class ConfigValidator:
                 "lower_bound": validated_config.lower_bound,
                 "grid_levels": validated_config.grid_levels,
                 "total_margin": validated_config.total_margin,
+                # 別名兼容：提供 total_amount 以便舊路徑使用
+                "total_amount": validated_config.total_margin,
                 "grid_type": validated_config.grid_type,
                 "grid_ratio": validated_config.grid_ratio,
                 "stop_bot_price": validated_config.stop_bot_price,
@@ -267,8 +280,9 @@ class ConfigValidator:
             }
 
             logger.info(
-                f"網格配置驗證成功",
-                extra={
+                "網格配置驗證成功",
+                event_type="config_validated",
+                data={
                     "user_id": validated_config.user_id,
                     "ticker": validated_config.ticker,
                     "direction": validated_config.direction.value,
