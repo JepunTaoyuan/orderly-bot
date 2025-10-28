@@ -40,30 +40,34 @@ class GridStats:
     arbitrage_count: int = 0  # 套利次數（每次完成買賣配對）
     total_arbitrage_profit: Decimal = Decimal('0')  # 總套利利潤
     
-    # 盈虧統計
+    # 新的收益分類統計
+    grid_profit: Decimal = Decimal('0')           # 網格收益（已完成買賣配對的套利利潤）
+    unpaired_profit: Decimal = Decimal('0')       # 未配對收益（未平倉持倉的浮動盈虧 + 資金費 + 手續費 + 訂單修改變動）
+    total_profit: Decimal = Decimal('0')          # 總收益（前兩項相加）
+
+    # 未配對收益的細分項目
+    funding_fees: Decimal = Decimal('0')          # 資金費用收入/支出
+    trading_fees: Decimal = Decimal('0')          # 交易手續費（已從realized_pnl中扣除）
+    order_modification_pnl: Decimal = Decimal('0') # 訂單修改導致的盈虧變動
+
+    # 盈虧統計（保留向後兼容）
     realized_pnl: Decimal = Decimal('0')
     unrealized_pnl: Decimal = Decimal('0')
     total_pnl: Decimal = Decimal('0')
-    
-    # 交易統計
+
+    # 內部統計（不對外顯示）
     winning_trades: int = 0
     losing_trades: int = 0
-    win_rate: Decimal = Decimal('0')
-    
+
     # 金額統計
     total_buy_cost: Decimal = Decimal('0')
     total_sell_revenue: Decimal = Decimal('0')
     total_fees: Decimal = Decimal('0')
-    
-    # 平均值統計
-    avg_profit_per_arbitrage: Decimal = Decimal('0')  # 平均每次套利利潤
-    avg_win: Decimal = Decimal('0')
-    avg_loss: Decimal = Decimal('0')
-    
-    # 最大值統計
-    max_win: Decimal = Decimal('0')
-    max_loss: Decimal = Decimal('0')
-    
+
+    # 網格專用統計
+    capital_utilization: Decimal = Decimal('0')  # 資金利用率
+    total_margin_used: Decimal = Decimal('0')     # 已使用保證金
+
     # 持倉統計
     current_position_qty: Decimal = Decimal('0')
     current_position_cost: Decimal = Decimal('0')
@@ -88,11 +92,58 @@ class ProfitTracker:
         
         # 累計統計數據
         self.stats = GridStats()
-        
-        # 運行時統計（用於計算平均值等）
-        self._profit_sum = Decimal('0')  # 盈利交易總和
-        self._loss_sum = Decimal('0')    # 虧損交易總和
-    
+
+        # 資金利用率相關
+        self.total_margin_allocated: Decimal = Decimal('0')  # 總分配保證金
+
+    def set_total_margin(self, total_margin: Decimal):
+        """
+        設置總保證金（用於計算資金利用率）
+
+        Args:
+            total_margin: 總保證金金額
+        """
+        self.total_margin_allocated = total_margin
+        logger.info(f"設置總保證金: {total_margin} USDT")
+
+    def _update_capital_utilization(self):
+        """更新資金利用率"""
+        if self.total_margin_allocated > Decimal('0'):
+            # 計算當前持倉的保證金需求
+            current_position_margin = sum(pos.buy_cost for pos in self.current_positions)
+            self.stats.total_margin_used = current_position_margin
+            self.stats.capital_utilization = (
+                (current_position_margin / self.total_margin_allocated) * Decimal('100')
+            ).quantize(Decimal('0.01'))
+
+    def add_funding_fee(self, fee: Decimal, timestamp: float = None):
+        """
+        添加資金費用記錄
+
+        Args:
+            fee: 資金費用（正數為收入，負數為支出）
+            timestamp: 時間戳（可選）
+        """
+        if timestamp is None:
+            timestamp = datetime.now().timestamp()
+
+        self.stats.funding_fees += fee
+        logger.info(f"添加資金費用: {fee} USDT")
+
+    def add_order_modification_pnl(self, pnl: Decimal, timestamp: float = None):
+        """
+        添加訂單修改導致的盈虧變動
+
+        Args:
+            pnl: 盈虧變動（正數為收益，負數為損失）
+            timestamp: 時間戳（可選）
+        """
+        if timestamp is None:
+            timestamp = datetime.now().timestamp()
+
+        self.stats.order_modification_pnl += pnl
+        logger.info(f"添加訂單修改盈虧: {pnl} USDT")
+
     def add_trade(self, side: OrderSide, price: Decimal, quantity: Decimal, 
                   timestamp: float = None, fee: Decimal = None) -> Dict:
         """
@@ -135,9 +186,12 @@ class ProfitTracker:
         
         # 處理持倉和套利計算
         arbitrage_info = self._process_position(side, price, quantity, cost, timestamp)
-        
+
         # 更新統計
         self._update_stats()
+
+        # 更新資金利用率
+        self._update_capital_utilization()
         
         logger.info(f"添加交易記錄: {side.value} {quantity} @ {price}, 成本/收入: {cost}")
         
@@ -190,18 +244,8 @@ class ProfitTracker:
                     self.stats.arbitrage_count += 1
                     self.stats.total_arbitrage_profit += arbitrage_profit
                     self.stats.realized_pnl += arbitrage_profit
-                    
-                    # 更新勝負統計
-                    if arbitrage_profit > 0:
-                        self.stats.winning_trades += 1
-                        self._profit_sum += arbitrage_profit
-                        if arbitrage_profit > self.stats.max_win:
-                            self.stats.max_win = arbitrage_profit
-                    elif arbitrage_profit < 0:
-                        self.stats.losing_trades += 1
-                        self._loss_sum += arbitrage_profit
-                        if arbitrage_profit < self.stats.max_loss:
-                            self.stats.max_loss = arbitrage_profit
+                    # 更新新的收益分類：网格收益
+                    self.stats.grid_profit += arbitrage_profit
                     
                     # 移除已完全賣出的持倉
                     self.current_positions.pop(0)
@@ -226,18 +270,8 @@ class ProfitTracker:
                     self.stats.arbitrage_count += 1
                     self.stats.total_arbitrage_profit += arbitrage_profit
                     self.stats.realized_pnl += arbitrage_profit
-                    
-                    # 更新勝負統計
-                    if arbitrage_profit > 0:
-                        self.stats.winning_trades += 1
-                        self._profit_sum += arbitrage_profit
-                        if arbitrage_profit > self.stats.max_win:
-                            self.stats.max_win = arbitrage_profit
-                    elif arbitrage_profit < 0:
-                        self.stats.losing_trades += 1
-                        self._loss_sum += arbitrage_profit
-                        if arbitrage_profit < self.stats.max_loss:
-                            self.stats.max_loss = arbitrage_profit
+                    # 更新新的收益分類：网格收益
+                    self.stats.grid_profit += arbitrage_profit
                     
                     # 更新原持倉（減少數量和成本）
                     position.quantity -= matched_qty
@@ -255,43 +289,31 @@ class ProfitTracker:
     
     def _update_stats(self):
         """更新統計數據"""
-        # 計算勝率
-        total_closed = self.stats.winning_trades + self.stats.losing_trades
-        if total_closed > 0:
-            self.stats.win_rate = (
-                Decimal(str(self.stats.winning_trades)) / Decimal(str(total_closed)) * Decimal('100')
-            ).quantize(Decimal('0.01'))
-        
-        # 計算平均套利利潤
-        if self.stats.arbitrage_count > 0:
-            self.stats.avg_profit_per_arbitrage = (
-                self.stats.total_arbitrage_profit / Decimal(str(self.stats.arbitrage_count))
-            ).quantize(Decimal('0.01'))
-        
-        # 計算平均盈利和虧損
-        if self.stats.winning_trades > 0:
-            self.stats.avg_win = (
-                self._profit_sum / Decimal(str(self.stats.winning_trades))
-            ).quantize(Decimal('0.01'))
-        
-        if self.stats.losing_trades > 0:
-            self.stats.avg_loss = (
-                self._loss_sum / Decimal(str(self.stats.losing_trades))
-            ).quantize(Decimal('0.01'))
-        
         # 當前持倉統計
         self.stats.current_position_qty = sum(pos.quantity for pos in self.current_positions)
         self.stats.current_position_cost = sum(pos.buy_cost for pos in self.current_positions)
-        
+
         if self.stats.current_position_qty > 0:
             self.stats.avg_entry_price = (
                 self.stats.current_position_cost / self.stats.current_position_qty
             ).quantize(Decimal('0.01'))
         else:
             self.stats.avg_entry_price = Decimal('0')
-        
-        # 總盈虧
+
+        # 總盈虧（向後兼容）
         self.stats.total_pnl = self.stats.realized_pnl + self.stats.unrealized_pnl
+
+        # 計算未配對收益 = 未實現盈虧 - 交易手續費 + 資金費 + 訂單修改盈虧
+        # 注意：交易手續費是成本，所以用減法
+        self.stats.unpaired_profit = (
+            self.stats.unrealized_pnl
+            - self.stats.total_fees
+            + self.stats.funding_fees
+            + self.stats.order_modification_pnl
+        )
+
+        # 總收益 = 網格收益 + 未配對收益
+        self.stats.total_profit = self.stats.grid_profit + self.stats.unpaired_profit
     
     def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """
@@ -344,30 +366,30 @@ class ProfitTracker:
             # 套利統計（核心指標）
             "arbitrage_count": self.stats.arbitrage_count,
             "total_arbitrage_profit": f"{self.stats.total_arbitrage_profit:.2f} USDT",
-            "avg_profit_per_arbitrage": f"{self.stats.avg_profit_per_arbitrage:.2f} USDT",
             
-            # 盈虧統計
+            # 新的收益分類統計
+            "grid_profit": f"{self.stats.grid_profit:.2f} USDT",
+            "unpaired_profit": f"{self.stats.unpaired_profit:.2f} USDT",
+            "total_profit": f"{self.stats.total_profit:.2f} USDT",
+
+            # 未配對收益的細分
+            "funding_fees": f"{self.stats.funding_fees:.2f} USDT",
+            "trading_fees": f"{self.stats.total_fees:.2f} USDT",
+            "order_modification_pnl": f"{self.stats.order_modification_pnl:.2f} USDT",
+
+            # 盈虧統計（向後兼容）
             "realized_pnl": f"{self.stats.realized_pnl:.2f} USDT",
             "unrealized_pnl": f"{self.stats.unrealized_pnl:.2f} USDT",
             "total_pnl": f"{self.stats.total_pnl:.2f} USDT",
-            
-            # 勝率統計
-            "winning_trades": self.stats.winning_trades,
-            "losing_trades": self.stats.losing_trades,
-            "win_rate": f"{self.stats.win_rate}%",
+
+            # 資金利用率統計
+            "capital_utilization": f"{self.stats.capital_utilization:.2f}%",
+            "total_margin_used": f"{self.stats.total_margin_used:.2f} USDT",
             
             # 金額統計
             "total_buy_cost": f"{self.stats.total_buy_cost:.2f} USDT",
             "total_sell_revenue": f"{self.stats.total_sell_revenue:.2f} USDT",
             "total_fees": f"{self.stats.total_fees:.2f} USDT",
-            
-            # 平均值
-            "avg_win": f"{self.stats.avg_win:.2f} USDT",
-            "avg_loss": f"{self.stats.avg_loss:.2f} USDT",
-            
-            # 最大值
-            "max_win": f"{self.stats.max_win:.2f} USDT",
-            "max_loss": f"{self.stats.max_loss:.2f} USDT",
             
             # 持倉統計
             "current_position_qty": f"{self.stats.current_position_qty}",
@@ -394,13 +416,25 @@ class ProfitTracker:
             "arbitrage_statistics": {
                 "total_arbitrage_count": self.stats.arbitrage_count,
                 "total_arbitrage_profit": f"{self.stats.total_arbitrage_profit:.2f} USDT",
-                "avg_profit_per_arbitrage": f"{self.stats.avg_profit_per_arbitrage:.2f} USDT",
             },
             "trading_statistics": {
                 "total_trades": self.stats.total_trades,
                 "buy_trades": self.stats.buy_trades,
                 "sell_trades": self.stats.sell_trades,
-                "win_rate": f"{self.stats.win_rate}%",
+            },
+            "capital_statistics": {
+                "capital_utilization": f"{self.stats.capital_utilization:.2f}%",
+                "total_margin_used": f"{self.stats.total_margin_used:.2f} USDT",
+            },
+            "profit_breakdown": {
+                "grid_profit": f"{self.stats.grid_profit:.2f} USDT",
+                "unpaired_profit": f"{self.stats.unpaired_profit:.2f} USDT",
+                "total_profit": f"{self.stats.total_profit:.2f} USDT",
+            },
+            "unpaired_profit_details": {
+                "funding_fees": f"{self.stats.funding_fees:.2f} USDT",
+                "trading_fees": f"{self.stats.total_fees:.2f} USDT",
+                "order_modification_pnl": f"{self.stats.order_modification_pnl:.2f} USDT",
             },
             "pnl_statistics": {
                 "realized_pnl": f"{self.stats.realized_pnl:.2f} USDT",
@@ -442,21 +476,25 @@ class ProfitTracker:
         print(f"\n🔄 套利統計")
         print(f"  套利次數: {summary['arbitrage_count']}")
         print(f"  總套利利潤: {summary['total_arbitrage_profit']}")
-        print(f"  平均每次套利: {summary['avg_profit_per_arbitrage']}")
         
-        print(f"\n💰 盈虧統計")
+        print(f"\n💰 收益分類統計")
+        print(f"  網格收益: {summary['grid_profit']}")
+        print(f"  未配對收益: {summary['unpaired_profit']}")
+        print(f"  總收益: {summary['total_profit']}")
+
+        print(f"\n📊 未配對收益細分")
+        print(f"  資金費用: {summary['funding_fees']}")
+        print(f"  交易手續費: {summary['trading_fees']}")
+        print(f"  訂單修改變動: {summary['order_modification_pnl']}")
+
+        print(f"\n💰 盈虧統計（向後兼容）")
         print(f"  已實現盈虧: {summary['realized_pnl']}")
         print(f"  未實現盈虧: {summary['unrealized_pnl']}")
         print(f"  總盈虧: {summary['total_pnl']}")
         
-        print(f"\n🎯 績效指標")
-        print(f"  勝率: {summary['win_rate']}")
-        print(f"  盈利次數: {summary['winning_trades']}")
-        print(f"  虧損次數: {summary['losing_trades']}")
-        print(f"  平均盈利: {summary['avg_win']}")
-        print(f"  平均虧損: {summary['avg_loss']}")
-        print(f"  最大盈利: {summary['max_win']}")
-        print(f"  最大虧損: {summary['max_loss']}")
+        print(f"\n💰 資金統計")
+        print(f"  資金利用率: {summary['capital_utilization']}")
+        print(f"  已使用保證金: {summary['total_margin_used']}")
         
         print(f"\n💵 金額統計")
         print(f"  總買入成本: {summary['total_buy_cost']}")

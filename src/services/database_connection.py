@@ -48,7 +48,7 @@ class DatabaseManager:
                 raise ValueError("MongoDB 連接字符串未提供")
 
             try:
-                # 創建客戶端
+                # 創建客戶端 - 禁用不必要的事務機制
                 self.client = AsyncIOMotorClient(
                     self.connection_string,
                     maxPoolSize=50,
@@ -56,8 +56,16 @@ class DatabaseManager:
                     maxIdleTimeMS=45000,
                     serverSelectionTimeoutMS=5000,
                     connectTimeoutMS=10000,
-                    retryWrites=True,
-                    w="majority"
+                    # 禁用重試寫入避免事務混亂
+                    retryWrites=False,
+                    retryReads=True,
+                    # 使用簡單的寫入確認
+                    w=1,
+                    # 簡化讀取配置
+                    readPreference="primary",
+                    # 禁用讀取關注級別避免事務
+                    # readConcern="majority",  # 註釋掉避免事務
+                    # writeConcern={"w": "majority", "j": True}  # 註釋掉避免事務
                 )
 
                 # 獲取數據庫

@@ -19,19 +19,33 @@ class MongoManager:
         return cls._instance
 
     def __init__(self, connection_string: Optional[str] = None) -> None:
-        """初始化 MongoDB 連接（僅第一次）"""
+        """初始化 MongoDB 連接（僅第一次）- 優化連接池配置"""
         if not self._initialized and connection_string:
             self.client: AsyncIOMotorClient = AsyncIOMotorClient(
                 connection_string,
-                maxPoolSize=50,
-                minPoolSize=10,
-                maxIdleTimeMS=45000,
-                serverSelectionTimeoutMS=5000
+                # 優化連接池配置以支持高並發
+                maxPoolSize=100,           # 增加最大連接數
+                minPoolSize=20,            # 增加最小連接數
+                maxIdleTimeMS=30000,       # 減少空閒時間，更快釋放連接
+                serverSelectionTimeoutMS=3000,  # 減少選擇超時時間
+                connectTimeoutMS=5000,     # 連接超時
+                socketTimeoutMS=10000,     # Socket 超時
+                heartbeatFrequencyMS=10000, # 心跳頻率
+                # 禁用重試寫入避免事務問題
+                retryWrites=False,         # 禁用自動重試寫入
+                retryReads=True,           # 保留讀取重試
+                # 簡化寫入確認
+                w=1,                       # 簡單寫入確認
+                # 簡化讀取偏好
+                readPreference="primary"   # 主節點讀取
             )
             self.db: AsyncIOMotorDatabase = self.client.get_default_database()
             self.users = self.db['users']
             self._initialized = True
-            logger.info("MongoDB 連接已初始化")
+            logger.info("MongoDB 連接已初始化（優化配置）", data={
+                "maxPoolSize": 100,
+                "minPoolSize": 20
+            })
 
     async def update_user_api_key_pair(self, user_id: str, api_key: str, api_secret: str) -> Any:
         """

@@ -3,6 +3,7 @@ import re
 import base58
 import time
 import json
+import asyncio
 from datetime import datetime, timedelta
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -20,9 +21,14 @@ class WalletSignatureVerifier:
     def __init__(self):
         """
         初始化錢包簽名驗證器 - 使用 MongoDB 持久化存儲防止重放攻擊
+        添加內存緩存作為降級方案
         """
         # 將在初始化時設置 MongoDB 連接
         self.nonces_collection = None
+        # 內存緩存作為最終降級方案
+        self.memory_nonces = {}
+        self.memory_cleanup_interval = 600  # 10分鐘清理一次
+        self.last_cleanup_time = time.time()
 
     def initialize_with_database(self, database):
         """
@@ -63,6 +69,39 @@ class WalletSignatureVerifier:
         except Exception as e:
             logger.error(f"創建索引失敗: {e}")
             # 索引創建失敗不應該阻止應用啟動
+
+    def _cleanup_memory_nonces(self, force=False):
+        """清理過期的內存 nonce"""
+        current_time = time.time()
+
+        # 檢查是否需要清理 (強制清理或到達清理時間)
+        if not force and current_time - self.last_cleanup_time < self.memory_cleanup_interval:
+            return
+
+        expired_nonces = []
+        for nonce, data in self.memory_nonces.items():
+            if current_time > data.get('expires_at', 0):
+                expired_nonces.append(nonce)
+
+        for nonce in expired_nonces:
+            del self.memory_nonces[nonce]
+
+        self.last_cleanup_time = current_time
+
+        if expired_nonces:
+            logger.debug(f"清理了 {len(expired_nonces)} 個過期的內存 nonce")
+
+    def _memory_nonce_exists(self, nonce: str) -> bool:
+        """檢查內存中是否存在 nonce"""
+        self._cleanup_memory_nonces()
+        return nonce in self.memory_nonces
+
+    def _add_memory_nonce(self, nonce: str, timestamp: int, expires_at: int):
+        """添加 nonce 到內存緩存"""
+        self.memory_nonces[nonce] = {
+            'timestamp': timestamp,
+            'expires_at': expires_at
+        }
 
     def _generate_message(self, timestamp: int, nonce: str) -> str:
         """
@@ -117,44 +156,144 @@ class WalletSignatureVerifier:
             logger.warning(f"簽名已過期: timestamp={timestamp}, current={current_time}")
             return False
 
-        try:
-            # 檢查 nonce 是否已使用（持久化檢查）
-            existing = await self.nonces_collection.find_one({"nonce": nonce})
-            if existing:
-                logger.warning(
-                    f"Nonce 重複使用檢測: {nonce}",
-                    event_type="security.replay_attempt",
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 檢查 nonce 是否已使用（持久化檢查）
+                existing = await self.nonces_collection.find_one({"nonce": nonce})
+                if existing:
+                    logger.warning(
+                        f"Nonce 重複使用檢測: {nonce}",
+                        event_type="security.replay_attempt",
+                        data={
+                            "nonce": nonce[:10] + "...",  # 只記錄部分 nonce 保護隱私
+                            "existing_timestamp": existing.get("timestamp"),
+                            "attempt_timestamp": timestamp
+                        }
+                    )
+                    return False
+
+                # 記錄 nonce 使用（持久化存儲）- 使用原子操作避免事務問題
+                expires_at = timestamp + self.SIGNATURE_VALIDITY_WINDOW
+
+                # 嘗試使用 try-catch 處理 MongoDB 事務錯誤
+                try:
+                    await self.nonces_collection.insert_one({
+                        "nonce": nonce,
+                        "timestamp": timestamp,
+                        "expires_at": expires_at,
+                        "created_at": current_time
+                    })
+                except Exception as insert_error:
+                    # 檢查是否為重複 key 錯誤
+                    if "duplicate key" in str(insert_error).lower() or "11000" in str(insert_error):
+                        logger.warning(f"Nonce 重複使用 (競爭條件): {nonce[:10]}...")
+                        return False
+                    # 檢查是否為事務相關錯誤
+                    elif "transaction" in str(insert_error).lower() or "unknown" in str(insert_error).lower():
+                        logger.warning(f"事務錯誤，嘗試重新插入 (嘗試 {attempt + 1}/{max_retries}): {insert_error}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))  # 遞增延遲
+                            continue
+                        else:
+                            # 最後一次嘗試失敗，使用降級策略
+                            logger.error(f"事務錯誤達到最大重試次數，使用降級策略: {insert_error}")
+                            return await self._fallback_nonce_validation(nonce, timestamp, current_time, expires_at)
+                    else:
+                        # 其他錯誤直接拋出
+                        raise insert_error
+
+                logger.debug(
+                    f"Nonce 記錄成功: {nonce[:10]}...",
+                    event_type="security.nonce_recorded",
                     data={
-                        "nonce": nonce[:10] + "...",  # 只記錄部分 nonce 保護隱私
-                        "existing_timestamp": existing.get("timestamp"),
-                        "attempt_timestamp": timestamp
+                        "nonce": nonce[:10] + "...",
+                        "expires_at": expires_at
                     }
+                )
+
+                return True
+
+            except Exception as e:
+                logger.error(f"Nonce 驗證失敗 (嘗試 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.1 * (attempt + 1))  # 遞增延遲
+                    continue
+                else:
+                    # 最後一次嘗試失敗
+                    logger.error(f"Nonce 驗證達到最大重試次數，拒絕請求: {e}")
+                    return False
+
+        return False
+
+    async def _fallback_nonce_validation(self, nonce: str, timestamp: int, current_time: int, expires_at: int) -> bool:
+        """
+        降級 nonce 驗證策略 - 當 MongoDB 事務失敗時使用
+        首先嘗試 upsert，如果還是失敗則使用內存緩存
+
+        Args:
+            nonce: 隨機 nonce
+            timestamp: 簽名時間戳
+            current_time: 當前時間
+            expires_at: 過期時間
+
+        Returns:
+            是否驗證通過
+        """
+        # 第一層降級：嘗試 upsert 操作
+        try:
+            result = await self.nonces_collection.update_one(
+                {"nonce": nonce},
+                {
+                    "$setOnInsert": {
+                        "nonce": nonce,
+                        "timestamp": timestamp,
+                        "expires_at": expires_at,
+                        "created_at": current_time
+                    }
+                },
+                upsert=True
+            )
+
+            # 如果是插入新文檔，說明 nonce 沒被使用過
+            if result.upserted_id:
+                logger.info(
+                    f"降級策略成功記錄 nonce: {nonce[:10]}...",
+                    event_type="security.nonce_fallback_success"
+                )
+                return True
+            else:
+                # 文檔已存在，說明 nonce 被使用過
+                logger.warning(
+                    f"降級策略檢測到重複 nonce: {nonce[:10]}...",
+                    event_type="security.nonce_fallback_duplicate"
                 )
                 return False
 
-            # 記錄 nonce 使用（持久化存儲）
-            expires_at = timestamp + self.SIGNATURE_VALIDITY_WINDOW
-            await self.nonces_collection.insert_one({
-                "nonce": nonce,
-                "timestamp": timestamp,
-                "expires_at": expires_at,
-                "created_at": current_time
-            })
+        except Exception as e:
+            logger.warning(f"MongoDB 降級策略失敗，使用內存緩存: {e}")
 
-            logger.debug(
-                f"Nonce 記錄成功: {nonce[:10]}...",
-                event_type="security.nonce_recorded",
-                data={
-                    "nonce": nonce[:10] + "...",
-                    "expires_at": expires_at
-                }
+        # 第二層降級：使用內存緩存
+        try:
+            # 檢查內存中是否已存在
+            if self._memory_nonce_exists(nonce):
+                logger.warning(
+                    f"內存緩存檢測到重複 nonce: {nonce[:10]}...",
+                    event_type="security.memory_duplicate"
+                )
+                return False
+
+            # 添加到內存緩存
+            self._add_memory_nonce(nonce, timestamp, expires_at)
+            logger.info(
+                f"內存緩存成功記錄 nonce: {nonce[:10]}...",
+                event_type="security.memory_fallback_success"
             )
-
             return True
 
         except Exception as e:
-            logger.error(f"Nonce 驗證失敗: {e}")
-            # 如果數據庫操作失敗，為安全起見拒絕請求
+            logger.error(f"內存緩存策略也失敗: {e}")
+            # 為安全起見，當所有驗證都失敗時拒絕請求
             return False
 
     def detect_wallet_type(self, address: str) -> str:

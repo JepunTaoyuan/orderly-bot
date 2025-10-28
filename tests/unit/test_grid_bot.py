@@ -594,13 +594,28 @@ class TestGridTradingBot:
 
         # Mock components
         bot.signal_generator = Mock()
-        bot.signal_generator.stop_by_signal = Mock()
+        bot.signal_generator.stop_by_signal = AsyncMock()
         bot.event_queue = Mock()
         bot.event_queue.stop = AsyncMock()
         bot.order_tracker = Mock()
         bot.order_tracker.clear = Mock()
+        bot.processed_fills = Mock()
+        bot.processed_fills.clear = Mock()
         bot.wss_client = Mock()
-        bot._safe_close_ws = Mock()
+        bot._safe_close_ws = AsyncMock()
+
+        # Mock market_info and client for position closing
+        bot.market_info = Mock()
+        bot.market_info.symbol = "BTC-USDT"
+        bot.client = Mock()
+        bot.client.get_positions = AsyncMock(return_value={
+            "success": True,
+            "data": {
+                "rows": []
+            }
+        })
+        bot.client.cancel_all_orders = AsyncMock()
+        bot._handle_cancel_all_signal = AsyncMock()
 
         bot.is_running = True
 
@@ -611,8 +626,69 @@ class TestGridTradingBot:
 
         # Verify cleanup was called
         bot.signal_generator.stop_by_signal.assert_called_once()
-        bot.event_queue.stop.assert_called_once()
         bot.order_tracker.clear.assert_called_once()
+        bot.processed_fills.clear.assert_called_once()
+        bot._safe_close_ws.assert_called_once()
+
+        # Verify position checking was called
+        bot.client.get_positions.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_grid_trading_with_position(self):
+        """Test stopping grid trading with open position."""
+        bot = GridTradingBot(
+            account_id="test_account_123",
+            orderly_key="test_key_123",
+            orderly_secret="test_secret_123",
+            orderly_testnet=True
+        )
+
+        # Mock components
+        bot.signal_generator = Mock()
+        bot.signal_generator.stop_by_signal = AsyncMock()
+        bot.event_queue = Mock()
+        bot.event_queue.stop = AsyncMock()
+        bot.order_tracker = Mock()
+        bot.order_tracker.clear = Mock()
+        bot.processed_fills = Mock()
+        bot.processed_fills.clear = Mock()
+        bot.wss_client = Mock()
+        bot._safe_close_ws = AsyncMock()
+
+        # Mock market_info and client with existing position
+        bot.market_info = Mock()
+        bot.market_info.symbol = "BTC-USDT"
+        bot.client = Mock()
+        bot.client.get_positions = AsyncMock(return_value={
+            "success": True,
+            "data": {
+                "rows": [{
+                    "symbol": "BTC-USDT",
+                    "position_qty": "0.1"
+                }]
+            }
+        })
+        bot.client.close_position = AsyncMock(return_value={
+            "success": True
+        })
+        bot.client.cancel_all_orders = AsyncMock()
+        bot._handle_cancel_all_signal = AsyncMock()
+
+        bot.is_running = True
+
+        await bot.stop_grid_trading()
+
+        # Verify bot is stopped
+        assert bot.is_running == False
+
+        # Verify position closing was called
+        bot.client.get_positions.assert_called_once()
+        bot.client.close_position.assert_called_once_with("BTC-USDT")
+
+        # Verify cleanup was called
+        bot.signal_generator.stop_by_signal.assert_called_once()
+        bot.order_tracker.clear.assert_called_once()
+        bot.processed_fills.clear.assert_called_once()
         bot._safe_close_ws.assert_called_once()
 
     @pytest.mark.asyncio

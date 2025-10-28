@@ -5,7 +5,7 @@ Orderly 交易客戶端
 負責處理實際的帳戶操作，包括開倉、平倉等
 """
 
-from orderly_evm_connector.rest import RestAsync 
+from orderly_evm_connector.rest import RestAsync
 from typing import Dict, Any, Optional
 import asyncio
 import time
@@ -36,19 +36,19 @@ class OrderlyClient:
     @with_orderly_api_handling("創建限價訂單")
     async def create_limit_order(self, symbol: str, side: str, price: float, quantity: float) -> Dict[str, Any]:
         """
-        創建限價訂單
-        
+        創建限價訂單（異步版本，使用 asyncio.sleep 替代 time.sleep）
+
         Args:
             symbol: 交易對符號 (如 'PERP_BTC_USDC')
             side: 訂單方向 ('BUY' 或 'SELL')
             price: 限價價格
             quantity: 訂單數量
-            
+
         Returns:
             訂單響應
         """
-        # 等待0.02秒，避免頻繁創建訂單
-        await asyncio.sleep(0.02)
+        # 使用異步延遲，避免頻繁創建訂單觸發 Orderly API 速率限制
+        await asyncio.sleep(0.1)
         return await self.client.create_order(
             symbol=symbol,
             order_type="LIMIT",

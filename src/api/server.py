@@ -12,7 +12,7 @@ FastAPI 伺服器 (MVP)
 
 import asyncio
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 import os
@@ -29,7 +29,7 @@ from src.utils.logging_config import configure_logging, get_logger, metrics, set
 from src.utils.error_codes import GridTradingException, ErrorCode
 from src.utils.market_validator import ValidationError
 from src.utils.api_helpers import SessionContextManager, validate_session_id, create_session_id
-from src.services.database_service import MongoManager
+from src.services.database_connection import DatabaseManager
 from fastapi.middleware.cors import CORSMiddleware
 from src.auth.wallet_signature import WalletSignatureVerifier
 from src.auth.auth_decorators import init_auth_dependencies, WalletAuthContext
@@ -38,6 +38,10 @@ from src.utils.slowapi_limiter import get_slowapi_rate_limiter, limiter, RATE_LI
 from slowapi.errors import RateLimitExceeded
 from src.utils.slowapi_dependencies import auto_rate_limit
 from src.core.grid_signal import GridType
+from src.utils.websocket_manager import start_websocket_manager, stop_websocket_manager
+from src.utils.system_monitor import start_system_monitor, stop_system_monitor, get_system_monitor
+from src.utils.error_recovery import start_error_recovery, stop_error_recovery, get_error_recovery_manager, ErrorSeverity
+from src.utils.mongodb_health import start_mongodb_health_monitoring, stop_mongodb_health_monitoring
 
 
 load_dotenv()
@@ -50,16 +54,35 @@ logger = get_logger("main")
 async def lifespan(app: FastAPI):
     """應用啟動時的初始化"""
     try:
-        # 初始化錢包驗證器的數據庫連接
-        if hasattr(mongo_manager, 'db'):
-            wallet_verifier.initialize_with_database(mongo_manager.db)
-            await wallet_verifier.ensure_indexes()
+        # 初始化統一數據庫連接
+        await db_manager.initialize(os.getenv("MONGODB_URI"))
+        logger.info("統一數據庫連接已初始化")
 
-            # 初始化認證依賴
-            init_auth_dependencies(mongo_manager, wallet_verifier)
-            logger.info("錢包驗證器初始化完成")
-        else:
-            logger.warning("MongoDB 連接未正確初始化，錢包驗證器將使用內存模式")
+        # 啟動系統監控器
+        await start_system_monitor()
+        logger.info("系統監控器已啟動")
+
+        # 啟動錯誤恢復機制
+        await start_error_recovery()
+        logger.info("錯誤恢復機制已啟動")
+
+        # 啟動 WebSocket 管理器
+        await start_websocket_manager()
+        logger.info("WebSocket 管理器已啟動")
+
+        # 初始化錢包驗證器的數據庫連接
+        database = await db_manager.get_database()
+        wallet_verifier.initialize_with_database(database)
+        await wallet_verifier.ensure_indexes()
+
+        # 初始化認證依賴 - 使用統一的 mongo manager
+        mongo_manager = await db_manager.get_mongo_manager()
+        init_auth_dependencies(mongo_manager, wallet_verifier)
+        logger.info("錢包驗證器初始化完成")
+
+        # 啟動 MongoDB 健康監控
+        await start_mongodb_health_monitoring(db_manager)
+        logger.info("MongoDB 健康監控已啟動")
 
         # 初始化速率限制器（SlowAPI）
         slowapi_limiter = get_slowapi_rate_limiter()
@@ -74,15 +97,52 @@ async def lifespan(app: FastAPI):
             "grid_control_limit": RATE_LIMITS['grid_control']
         })
 
+        logger.info("應用初始化完成")
+
     except Exception as e:
         logger.error(f"安全組件初始化失敗: {e}")
         # 初始化失敗不應該阻止應用啟動
-    
+
     # 應用運行期間
     yield
-    
+
     # 應用關閉時的清理
     logger.info("應用正在關閉，執行清理操作...")
+
+    # 停止系統監控器
+    try:
+        await stop_system_monitor()
+        logger.info("系統監控器已停止")
+    except Exception as e:
+        logger.error(f"停止系統監控器失敗: {e}")
+
+    # 停止錯誤恢復機制
+    try:
+        await stop_error_recovery()
+        logger.info("錯誤恢復機制已停止")
+    except Exception as e:
+        logger.error(f"停止錯誤恢復機制失敗: {e}")
+
+    # 停止 MongoDB 健康監控
+    try:
+        await stop_mongodb_health_monitoring()
+        logger.info("MongoDB 健康監控已停止")
+    except Exception as e:
+        logger.error(f"停止 MongoDB 健康監控失敗: {e}")
+
+    # 停止 WebSocket 管理器
+    try:
+        await stop_websocket_manager()
+        logger.info("WebSocket 管理器已停止")
+    except Exception as e:
+        logger.error(f"停止 WebSocket 管理器失敗: {e}")
+
+    # 關閉數據庫連接
+    try:
+        await db_manager.close()
+        logger.info("數據庫連接已關閉")
+    except Exception as e:
+        logger.error(f"關閉數據庫連接失敗: {e}")
 
 app = FastAPI(title="Grid Trading Server", version="1.0.0", lifespan=lifespan)
 
@@ -92,7 +152,7 @@ wallet_verifier = WalletSignatureVerifier()
 #For test
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175"],
+    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175", "https://orderly-front-delta.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,8 +161,8 @@ app.add_middleware(
 # 全域會話管理器
 session_manager = SessionManager()
 
-# 全域MongoDB管理器
-mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
+# 全域統一數據庫管理器
+db_manager = DatabaseManager()
 
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
@@ -362,6 +422,7 @@ async def start_grid(request: Request, config: StartConfig):
         )
 
     session_id = create_session_id(config.user_id, config.ticker)
+    print(session_id)
     
     with SessionContextManager(session_id):
         try:
@@ -524,6 +585,45 @@ async def list_sessions(request: Request):
             original_error=e
         )
 
+@app.get("/api/user/strategies/{user_id}")
+@limiter.limit(RATE_LIMITS['status_check'])
+@api_retry
+async def get_user_grid_strategies(request: Request, user_id: str):
+    """
+    獲取指定用戶的所有當前正在運行的grid策略
+
+    Args:
+        user_id: 用戶ID (路由參數)
+
+    Returns:
+        該用戶的所有活躍grid策略詳細信息
+    """
+    try:
+        # 獲取用戶的所有會話
+        user_sessions = await session_manager.get_user_sessions(user_id)
+
+        return {
+            "success": True,
+            "data": {
+                "user_id": user_id,
+                "strategies": list[str, Any](user_sessions.values()),
+                "total_strategies": len(user_sessions)
+            }
+        }
+
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("獲取用戶grid策略失敗", event_type="get_user_grid_strategies_error", data={
+            "user_id": user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"user_id": user_id},
+            original_error=e
+        )
+
 @app.get("/api/grid/profit/{session_id}")
 @limiter.limit(RATE_LIMITS['status_check'])
 async def get_profit_report(request: Request, session_id: str):
@@ -596,7 +696,7 @@ async def readiness_check():
             details={"check_type": "readiness"},
             original_error=e
         )
-
+ 
 # 常數定義
 DEFAULT_METRICS_LIMIT_COUNTERS = 10
 DEFAULT_METRICS_LIMIT_GAUGES = 5
@@ -630,6 +730,140 @@ async def get_metrics(
         logger.error("獲取指標失敗", event_type="metrics", data={"error": str(e)})
         raise HTTPException(status_code=500, detail=f"failed_to_get_metrics: {e}")
 
+@app.get("/system/health")
+async def system_health_check():
+    """系統健康檢查端點"""
+    try:
+        system_monitor = get_system_monitor()
+        health_status = await system_monitor.check_health()
+
+        # 根據健康狀態返回相應的 HTTP 狀態碼
+        status_code = 200
+        if health_status['status'] == 'unhealthy':
+            status_code = 503
+        elif health_status['status'] == 'error':
+            status_code = 500
+
+        return JSONResponse(
+            status_code=status_code,
+            content=health_status
+        )
+    except Exception as e:
+        logger.error("系統健康檢查失敗", event_type="health_check", data={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Health check failed: {e}")
+
+@app.get("/system/metrics")
+async def get_system_metrics():
+    """獲取詳細的系統指標"""
+    try:
+        system_monitor = get_system_monitor()
+        current_metrics = await system_monitor.collect_metrics()
+
+        # 轉換為可序列化的字典
+        return {
+            "timestamp": current_metrics.timestamp,
+            "system": {
+                "cpu_percent": current_metrics.cpu_percent,
+                "memory_percent": current_metrics.memory_percent,
+                "memory_used_mb": current_metrics.memory_used_mb,
+                "memory_available_mb": current_metrics.memory_available_mb,
+                "disk_usage_percent": current_metrics.disk_usage_percent,
+                "event_loop_lag_ms": current_metrics.event_loop_lag
+            },
+            "application": {
+                "active_sessions": current_metrics.active_sessions,
+                "websocket_connections": current_metrics.websocket_connections,
+                "queue_sizes": current_metrics.queue_sizes
+            },
+            "gc": {
+                "collections": list(current_metrics.gc_counts)
+            }
+        }
+    except Exception as e:
+        logger.error("獲取系統指標失敗", event_type="system_metrics", data={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get system metrics: {e}")
+
+@app.post("/system/gc")
+async def force_garbage_collection():
+    """強制垃圾回收"""
+    try:
+        system_monitor = get_system_monitor()
+        result = await system_monitor.force_gc()
+
+        return {
+            "success": True,
+            "data": result,
+            "message": "垃圾回收已完成"
+        }
+    except Exception as e:
+        logger.error("強制垃圾回收失敗", event_type="gc_failed", data={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Garbage collection failed: {e}")
+
+@app.get("/system/stats")
+async def get_system_stats():
+    """獲取系統統計信息"""
+    try:
+        # 收集各組件統計
+        system_monitor = get_system_monitor()
+        ws_manager = get_websocket_manager()
+        error_recovery = get_error_recovery_manager()
+
+        # 系統指標歷史
+        metrics_history = await system_monitor.get_metrics_history(limit=10)
+
+        # WebSocket 統計
+        ws_stats = await ws_manager.get_stats()
+
+        # Session 統計
+        session_stats = {
+            'total_attempts': session_manager.creation_metrics['total_attempts'],
+            'successful': session_manager.creation_metrics['successful'],
+            'failed': session_manager.creation_metrics['failed'],
+            'rate_limited': session_manager.creation_metrics['rate_limited'],
+            'active_sessions': len(session_manager.sessions)
+        }
+
+        # 錯誤恢復統計
+        error_recovery_stats = error_recovery.get_error_statistics()
+
+        return {
+            "timestamp": time.time(),
+            "system_monitor": {
+                "is_monitoring": system_monitor.is_monitoring,
+                "metrics_count": len(metrics_history)
+            },
+            "websocket": ws_stats,
+            "sessions": session_stats,
+            "error_recovery": error_recovery_stats,
+            "metrics_history": [
+                {
+                    "timestamp": m.timestamp,
+                    "cpu_percent": m.cpu_percent,
+                    "memory_percent": m.memory_percent,
+                    "active_sessions": m.active_sessions,
+                    "websocket_connections": m.websocket_connections
+                }
+                for m in metrics_history
+            ]
+        }
+    except Exception as e:
+        logger.error("獲取系統統計失敗", event_type="system_stats", data={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get system stats: {e}")
+
+@app.get("/system/recovery/stats")
+async def get_error_recovery_stats():
+    """獲取錯誤恢復統計信息"""
+    try:
+        error_recovery = get_error_recovery_manager()
+        stats = error_recovery.get_error_statistics()
+        return {
+            "success": True,
+            "data": stats
+        }
+    except Exception as e:
+        logger.error("獲取錯誤恢復統計失敗", event_type="error_recovery_stats", data={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get error recovery stats: {e}")
+
 @app.get("/api/auth/challenge")
 @limiter.limit(RATE_LIMITS['auth'])
 async def get_challenge(request: Request):
@@ -645,6 +879,118 @@ async def get_challenge(request: Request):
         raise GridTradingException(
             error_code=ErrorCode.INTERNAL_SERVER_ERROR,
             details={"reason": "challenge generation failed"},
+            original_error=e
+        )
+
+class StopConfig(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "session_id": "user123_PERP_ETH_USDC",
+        }
+    })
+
+    session_id: str = Field(..., min_length=1)
+
+@app.post("/api/grid/teststop")
+@limiter.limit(RATE_LIMITS['grid_control'])
+@api_retry
+async def stop_grid(request: Request, config: StopConfig):
+    session_id = validate_session_id(config.session_id)
+
+    # 解析 user_id
+    try:
+        # 支持 ticker 中包含下劃線，僅按第一個下劃線拆分
+        user_id, _ = session_id.split('_', 1)
+    except ValueError:
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_SESSION_ID,
+            details={"session_id": session_id}
+        )
+
+    with SessionContextManager(session_id):
+        try:
+            logger.info("停止網格交易請求", event_type="grid_stop", data={"session_id": session_id})
+            metrics.increment_counter("api.grid.stop.requests")
+            
+            success = await session_manager.stop_session(session_id)
+            
+            if success:
+                metrics.increment_counter("api.grid.stop.success")
+                logger.info("網格交易停止成功", event_type="grid_stopped", data={"session_id": session_id})
+                return {"success": True, "data": {"status": "stopped", "session_id": session_id}}
+            else:
+                # 會話不存在的情況
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_NOT_FOUND,
+                    details={"session_id": session_id}
+                )
+                
+        except GridTradingException:
+            # 重新拋出自定義異常，讓全域處理器處理
+            raise
+        except Exception as e:
+            metrics.increment_counter("api.grid.stop.errors")
+            logger.error("停止網格交易失敗", event_type="grid_stop_error", data={
+                "session_id": session_id,
+                "error": str(e)
+            })
+            raise GridTradingException(
+                error_code=ErrorCode.SESSION_STOP_FAILED,
+                details={"session_id": session_id},
+                original_error=e
+            )
+
+@app.post("/api/grid/cleanup/{session_id}")
+@limiter.limit(RATE_LIMITS['grid_control'])
+@api_retry
+async def cleanup_session(request: Request, session_id: str):
+    """強制清理會話的所有相關數據"""
+    try:
+        # 驗證會話ID
+        session_id = validate_session_id(session_id)
+
+        # 解析 user_id
+        try:
+            user_id, _ = session_id.split('_', 1)
+        except ValueError:
+            raise GridTradingException(
+                error_code=ErrorCode.INVALID_SESSION_ID,
+                details={"session_id": session_id}
+            )
+
+        # 強制清理會話
+        cleaned = await session_manager.force_cleanup_session(session_id)
+
+        if cleaned:
+            logger.info("會話強制清理成功", event_type="session_cleanup", data={"session_id": session_id})
+            return {
+                "success": True,
+                "data": {
+                    "status": "cleaned",
+                    "session_id": session_id,
+                    "message": "會話已強制清理"
+                }
+            }
+        else:
+            return {
+                "success": True,
+                "data": {
+                    "status": "no_cleanup_needed",
+                    "session_id": session_id,
+                    "message": "沒有需要清理的會話數據"
+                }
+            }
+
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("強制清理會話失敗", event_type="session_cleanup_error", data={
+            "session_id": session_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"session_id": session_id},
             original_error=e
         )
 

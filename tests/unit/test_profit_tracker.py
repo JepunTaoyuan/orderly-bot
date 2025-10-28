@@ -9,7 +9,7 @@ import json
 from decimal import Decimal
 from datetime import datetime
 from src.core.profit_tracker import (
-    ProfitTracker, Trade, Position, GridStats, OrderSide
+    ProfitTracker, CurrentPosition, GridStats, OrderSide
 )
 
 

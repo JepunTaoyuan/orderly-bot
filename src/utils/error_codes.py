@@ -31,6 +31,8 @@ class ErrorCode(Enum):
     SESSION_CREATE_FAILED = "E3002"
     SESSION_STOP_FAILED = "E3003"
     UNKNOWN_WALLET_TYPE = "E3004"
+    SESSION_CREATE_RATE_LIMITED = "E3005"
+    INVALID_SESSION_ID = "E3006"
     
     # 交易相關錯誤 (4000-4999)
     INVALID_SYMBOL = "E4000"
@@ -62,6 +64,11 @@ class ErrorCode(Enum):
     USER_API_KEY_PAIR_NOT_FOUND = "E7004"
     USER_API_KEY_PAIR_CHECK_FAILED = "E7005"
     USER_CREATION_FAILED = "E7006"
+
+    # WebSocket 錯誤 (7500-7999)
+    WEBSOCKET_CONNECTION_FAILED = "E7500"
+    WEBSOCKET_CONNECTION_LIMIT_EXCEEDED = "E7501"
+    WEBSOCKET_RECONNECT_FAILED = "E7502"
 
     # 斷路器錯誤 (8000-8999)
     CIRCUIT_BREAKER_OPEN = "E8000"
@@ -144,6 +151,20 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         description="Failed to stop the trading session",
         http_status=500,
         user_message="停止交易會話失敗"
+    ),
+    ErrorCode.SESSION_CREATE_RATE_LIMITED: ErrorDetail(
+        code=ErrorCode.SESSION_CREATE_RATE_LIMITED,
+        message="Session creation rate limited",
+        description="Too many sessions are being created simultaneously",
+        http_status=429,
+        user_message="請求過於頻繁，請稍後重試"
+    ),
+    ErrorCode.INVALID_SESSION_ID: ErrorDetail(
+        code=ErrorCode.INVALID_SESSION_ID,
+        message="Invalid session ID",
+        description="The session ID format is invalid",
+        http_status=400,
+        user_message="會話ID格式不正確"
     ),
     
     # 交易相關錯誤
@@ -267,6 +288,28 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
     ),
 
     # 斷路器錯誤
+    ErrorCode.WEBSOCKET_CONNECTION_FAILED: ErrorDetail(
+        code=ErrorCode.WEBSOCKET_CONNECTION_FAILED,
+        message="WebSocket connection failed",
+        description="Failed to establish WebSocket connection",
+        http_status=503,
+        user_message="WebSocket 連接失敗"
+    ),
+    ErrorCode.WEBSOCKET_CONNECTION_LIMIT_EXCEEDED: ErrorDetail(
+        code=ErrorCode.WEBSOCKET_CONNECTION_LIMIT_EXCEEDED,
+        message="WebSocket connection limit exceeded",
+        description="Too many WebSocket connections are open",
+        http_status=429,
+        user_message="WebSocket 連接數過多，請稍後重試"
+    ),
+    ErrorCode.WEBSOCKET_RECONNECT_FAILED: ErrorDetail(
+        code=ErrorCode.WEBSOCKET_RECONNECT_FAILED,
+        message="WebSocket reconnection failed",
+        description="Failed to reconnect WebSocket after disconnection",
+        http_status=503,
+        user_message="WebSocket 重連失敗"
+    ),
+
     ErrorCode.CIRCUIT_BREAKER_OPEN: ErrorDetail(
         code=ErrorCode.CIRCUIT_BREAKER_OPEN,
         message="Circuit breaker is open",
