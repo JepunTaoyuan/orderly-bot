@@ -91,7 +91,7 @@ class DatabaseManager:
         """確保必要的索引存在"""
         try:
             # 用戶集合索引
-            await self.db.users.create_index("user_id", unique=True)
+            await self.db.users.create_index("_id", unique=True)
 
             # nonce 集合索引（用於簽名驗證）
             await self.db.used_nonces.create_index("nonce", unique=True, background=True)

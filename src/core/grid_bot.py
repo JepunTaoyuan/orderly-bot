@@ -10,6 +10,7 @@ import json
 import time
 from decimal import Decimal
 from typing import Dict, Any
+from datetime import datetime
 from .grid_signal import GridSignalGenerator, TradingSignal, Direction, OrderSide
 from .client import OrderlyClient
 from .profit_tracker import ProfitTracker  # ⭐ 新增利潤追蹤
@@ -17,6 +18,7 @@ from src.utils.event_queue import SessionEventQueue, Event, EventType
 from src.utils.market_validator import MarketValidator, ValidationError
 from src.utils.order_tracker import OrderTracker, OrderStatus
 from src.utils.logging_config import get_logger, metrics, set_session_context
+from src.models.grid_summary import GridSummary, StopReason
 from orderly_evm_connector.websocket.websocket_api import WebsocketPrivateAPIClient
 from src.utils.websocket_manager import get_websocket_manager, WSConnectionState
 
@@ -57,6 +59,12 @@ class GridTradingBot:
         
         # ⭐ 新增：利潤追蹤器
         self.profit_tracker: ProfitTracker = None
+
+        # ⭐ 新增：網格總結服務
+        self.grid_summary_service = None
+
+        # 記錄開始時間用於總結
+        self.start_time: datetime = None
 
         # WebSocket 事件去重
         self.processed_fills = {}
@@ -980,6 +988,19 @@ class GridTradingBot:
             # ⭐ 設置總保證金用於計算資金利用率
             self.profit_tracker.set_total_margin(Decimal(str(config['total_margin'])))
             logger.info("利潤追蹤器已初始化")
+
+            # ⭐ 新增：記錄開始時間
+            self.start_time = datetime.utcnow()
+
+            # ⭐ 新增：初始化網格總結服務
+            from src.services.database_connection import db_manager
+            from src.services.grid_summary_service import GridSummaryService
+            database = await db_manager.get_database()
+            self.grid_summary_service = GridSummaryService(database)
+
+            # 確保索引存在
+            await self.grid_summary_service.ensure_indexes()
+            logger.info("網格總結服務已初始化")
             
             # 創建並啟動事件隊列
             self.event_queue = SessionEventQueue(
@@ -1052,9 +1073,9 @@ class GridTradingBot:
             })
             raise
     
-    async def stop_grid_trading(self):
+    async def stop_grid_trading(self, stop_reason: StopReason = StopReason.MANUAL):
         """停止網格交易"""
-        logger.info("停止網格交易機器人")
+        logger.info("停止網格交易機器人", data={"stop_reason": stop_reason.value})
 
         # 禁用 WebSocket 重連
         self.ws_should_reconnect = False
@@ -1129,9 +1150,15 @@ class GridTradingBot:
 
         if self.wss_client:
             await self._safe_close_ws()
-        
+
+        # ⭐ 新增：保存網格總結數據
+        try:
+            await self._save_grid_summary(stop_reason)
+        except Exception as e:
+            logger.error(f"保存網格總結時發生錯誤: {e}")
+
         self.is_running = False
-        logger.info("網格交易機器人已停止", event_type="bot_stopped")
+        logger.info("網格交易機器人已停止", event_type="bot_stopped", data={"stop_reason": stop_reason.value})
     
     async def get_status(self):
         """獲取機器人狀態（包含利潤統計）"""
@@ -1216,23 +1243,23 @@ class GridTradingBot:
     async def get_profit_report(self) -> Dict[str, Any]:
         """
         ⭐ 新增：獲取利潤報告
-        
+
         Returns:
             利潤報告字典
         """
         if not self.profit_tracker:
             return {"error": "利潤追蹤器未初始化"}
-        
+
         try:
             # 獲取當前價格
             positions = await self.client.get_positions()
             current_price = None
-            
+
             for position in positions.get('data', {}).get('rows', []):
                 if position.get('symbol') == self.profit_tracker.symbol:
                     current_price = Decimal(str(position.get('mark_price', 0)))
                     break
-            
+
             # 獲取完整報告
             return {
                 "summary": self.profit_tracker.get_summary(current_price),
@@ -1240,7 +1267,96 @@ class GridTradingBot:
                 "closed_positions": self.profit_tracker.get_closed_positions(limit=10),
                 "open_positions": self.profit_tracker.get_open_positions()
             }
-            
+
         except Exception as e:
             logger.error(f"獲取利潤報告失敗: {e}")
             return {"error": str(e)}
+
+    async def _save_grid_summary(self, stop_reason: StopReason):
+        """
+        ⭐ 新增：保存網格交易總結數據
+
+        Args:
+            stop_reason: 停止原因
+        """
+        try:
+            if not self.start_time or not self.grid_summary_service:
+                logger.warning("無法保存網格總結：缺少必要信息")
+                return
+
+            # 獲取最終的利潤數據
+            if not self.profit_tracker:
+                logger.warning("無法保存網格總結：利潤追蹤器未初始化")
+                return
+
+            # 獲取當前價格
+            positions = await self.client.get_positions()
+            current_price = None
+
+            for position in positions.get('data', {}).get('rows', []):
+                if position.get('symbol') == self.profit_tracker.symbol:
+                    current_price = Decimal(str(position.get('mark_price', 0)))
+                    break
+
+            # 獲取利潤摘要
+            profit_summary = self.profit_tracker.get_summary(current_price)
+
+            # 構建網格配置快照
+            grid_config = {}
+            if self.signal_generator:
+                grid_config = {
+                    "ticker": self.signal_generator.ticker,
+                    "direction": self.signal_generator.direction.value if hasattr(self.signal_generator.direction, 'value') else str(self.signal_generator.direction),
+                    "grid_type": self.signal_generator.grid_type.value if hasattr(self.signal_generator.grid_type, 'value') else str(self.signal_generator.grid_type),
+                    "grid_levels": self.signal_generator.grid_levels,
+                    "upper_bound": self.signal_generator.upper_bound,
+                    "lower_bound": self.signal_generator.lower_bound,
+                    "total_margin": self.signal_generator.total_margin
+                }
+
+            # 解析用戶ID
+            user_id = None
+            if self.session_id:
+                try:
+                    user_id, _ = self.session_id.split('_', 1)
+                except ValueError:
+                    logger.warning(f"無法解析用戶ID從session_id: {self.session_id}")
+                    return
+
+            # 創建網格總結
+            end_time = datetime.utcnow()
+            summary = GridSummary.create_from_bot_data(
+                session_id=self.session_id,
+                user_id=user_id,
+                start_time=self.start_time,
+                end_time=end_time,
+                profit_data={
+                    "total_profit": float(profit_summary.get("total_profit", 0)),
+                    "grid_profit": float(profit_summary.get("grid_profit", 0)),
+                    "unpaired_profit": float(profit_summary.get("unpaired_profit", 0)),
+                    "arbitrage_times": profit_summary.get("arbitrage_times", 0)
+                },
+                grid_config=grid_config,
+                stop_reason=stop_reason,
+                max_drawdown=profit_summary.get("max_drawdown"),
+                capital_utilization=profit_summary.get("capital_utilization")
+            )
+
+            # 保存到數據庫
+            document_id = await self.grid_summary_service.save_grid_summary(summary)
+
+            logger.info("網格總結已保存", event_type="grid_summary_saved", data={
+                "document_id": document_id,
+                "session_id": self.session_id,
+                "user_id": user_id,
+                "total_profit": summary.total_profit,
+                "arbitrage_times": summary.arbitrage_times,
+                "stop_reason": stop_reason.value
+            })
+
+        except Exception as e:
+            logger.error("保存網格總結失敗", event_type="grid_summary_save_error", data={
+                "session_id": self.session_id,
+                "error": str(e)
+            })
+            # 不拋出異常，避免影響正常的停止流程

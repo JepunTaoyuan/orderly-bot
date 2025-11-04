@@ -13,6 +13,7 @@ FastAPI 伺服器 (MVP)
 import asyncio
 import time
 from typing import Any, Optional
+from datetime import datetime
 
 from dotenv import load_dotenv
 import os
@@ -42,6 +43,8 @@ from src.utils.websocket_manager import start_websocket_manager, stop_websocket_
 from src.utils.system_monitor import start_system_monitor, stop_system_monitor, get_system_monitor
 from src.utils.error_recovery import start_error_recovery, stop_error_recovery, get_error_recovery_manager, ErrorSeverity
 from src.utils.mongodb_health import start_mongodb_health_monitoring, stop_mongodb_health_monitoring
+from src.models.grid_summary import GridSummaryFilter
+from src.services.grid_summary_service import GridSummaryService
 
 
 load_dotenv()
@@ -50,8 +53,14 @@ load_dotenv()
 configure_logging(level="INFO", format_json=True)
 logger = get_logger("main")
 
+# 全域統一數據庫管理器
+db_manager = DatabaseManager()
+
+mongo_manager = None  # 聲明全域變數
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global mongo_manager
     """應用啟動時的初始化"""
     try:
         # 初始化統一數據庫連接
@@ -161,9 +170,6 @@ app.add_middleware(
 # 全域會話管理器
 session_manager = SessionManager()
 
-# 全域統一數據庫管理器
-db_manager = DatabaseManager()
-
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
 async def grid_trading_exception_handler(request: Request, exc: GridTradingException):
@@ -247,7 +253,7 @@ async def enable_bot_trading(request: Request, config: RegisterConfig):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": config.user_id}
-            )  
+            )
         
         config.user_api_key = "ed25519:" + config.user_api_key
         config.user_api_secret = "ed25519:" + config.user_api_secret
@@ -993,6 +999,171 @@ async def cleanup_session(request: Request, session_id: str):
             details={"session_id": session_id},
             original_error=e
         )
+
+@app.get("/api/grid/summaries/{user_id}")
+@limiter.limit(RATE_LIMITS['status_check'])
+@api_retry
+async def get_grid_summaries(request: Request, user_id: str, start_date: Optional[str] = None, end_date: Optional[str] = None,
+                            stop_reason: Optional[str] = None, limit: int = 20, offset: int = 0):
+    """
+    獲取用戶的網格交易總結列表
+
+    Args:
+        user_id: 用戶ID
+        start_date: 開始日期 (ISO 8601 格式)
+        end_date: 結束日期 (ISO 8601 格式)
+        stop_reason: 停止原因過濾
+        limit: 返回數量限制 (1-100)
+        offset: 偏移量
+
+    Returns:
+        網格總結列表和統計信息
+    """
+    try:
+        # 檢查用戶是否存在
+        if not await mongo_manager.get_user(user_id):
+            raise GridTradingException(
+                error_code=ErrorCode.USER_NOT_FOUND,
+                details={"user_id": user_id}
+            )
+
+        # 創建過濾器
+        filter_data = GridSummaryFilter(
+            user_id=user_id,
+            start_date=datetime.fromisoformat(start_date) if start_date else None,
+            end_date=datetime.fromisoformat(end_date) if end_date else None,
+            stop_reason=stop_reason,
+            limit=min(max(limit, 1), 100),  # 限制在 1-100 之間
+            offset=max(offset, 0)  # 確保不為負數
+        )
+
+        # 獲取數據庫連接
+        database = await db_manager.get_database()
+        grid_summary_service = GridSummaryService(database)
+
+        # 查詢網格總結
+        result = await grid_summary_service.get_grid_summaries_by_user(user_id, filter_data)
+
+        return {
+            "success": True,
+            "data": result
+        }
+
+    except GridTradingException:
+        raise
+    except ValueError as e:
+        # 處理日期格式錯誤
+        raise GridTradingException(
+            error_code=ErrorCode.INVALID_GRID_CONFIG,
+            details={"validation_error": f"日期格式錯誤: {str(e)}"}
+        )
+    except Exception as e:
+        logger.error("獲取網格總結列表失敗", event_type="get_grid_summaries_error", data={
+            "user_id": user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"user_id": user_id},
+            original_error=e
+        )
+
+
+@app.get("/api/grid/summary/{session_id}")
+@limiter.limit(RATE_LIMITS['status_check'])
+@api_retry
+async def get_grid_summary(request: Request, session_id: str):
+    """
+    獲取特定網格會話的詳細總結
+
+    Args:
+        session_id: 會話ID
+
+    Returns:
+        網格總結詳細信息
+    """
+    try:
+        # 驗證會話ID格式
+        session_id = validate_session_id(session_id)
+
+        # 獲取數據庫連接
+        database = await db_manager.get_database()
+        grid_summary_service = GridSummaryService(database)
+
+        # 查詢網格總結
+        summary = await grid_summary_service.get_grid_summary_by_session(session_id)
+
+        if not summary:
+            raise GridTradingException(
+                error_code=ErrorCode.SESSION_NOT_FOUND,
+                details={"session_id": session_id, "message": "找不到該會話的總結數據"}
+            )
+
+        return {
+            "success": True,
+            "data": summary
+        }
+
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("獲取網格總結失敗", event_type="get_grid_summary_error", data={
+            "session_id": session_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"session_id": session_id},
+            original_error=e
+        )
+
+
+@app.get("/api/grid/statistics/{user_id}")
+@limiter.limit(RATE_LIMITS['status_check'])
+@api_retry
+async def get_user_grid_statistics(request: Request, user_id: str):
+    """
+    獲取用戶的網格交易統計信息
+
+    Args:
+        user_id: 用戶ID
+
+    Returns:
+        用戶網格交易統計信息
+    """
+    try:
+        # 檢查用戶是否存在
+        if not await mongo_manager.get_user(user_id):
+            raise GridTradingException(
+                error_code=ErrorCode.USER_NOT_FOUND,
+                details={"user_id": user_id}
+            )
+
+        # 獲取數據庫連接
+        database = await db_manager.get_database()
+        grid_summary_service = GridSummaryService(database)
+
+        # 獲取統計信息
+        statistics = await grid_summary_service.get_user_statistics(user_id)
+
+        return {
+            "success": True,
+            "data": statistics
+        }
+
+    except GridTradingException:
+        raise
+    except Exception as e:
+        logger.error("獲取用戶統計信息失敗", event_type="get_user_statistics_error", data={
+            "user_id": user_id,
+            "error": str(e)
+        })
+        raise GridTradingException(
+            error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+            details={"user_id": user_id},
+            original_error=e
+        )
+
 
 @app.get("/")
 async def root():

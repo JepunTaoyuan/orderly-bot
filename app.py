@@ -18,7 +18,7 @@ def main():
     uvicorn.run(
         "src.api.server:app",  # 使用字符串導入以支持 reload
         host=os.getenv("UVICORN_HOST", "0.0.0.0"),
-        port=int(os.getenv("UVICORN_PORT", "8000")),
+        port=int(os.getenv("UVICORN_PORT", "8001")),
         reload=True,
         log_level="info"
     )
