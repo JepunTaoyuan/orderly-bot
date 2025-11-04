@@ -13,7 +13,8 @@
       "Bash(python3:*)",
       "Bash(python:*)",
       "Bash(git checkout:*)",
-      "Bash(PYTHONPATH=/mnt/c/Users/user/Desktop/orderly_back/orderly_bot python:*)"
+      "Bash(PYTHONPATH=/mnt/c/Users/user/Desktop/orderly_back/orderly_bot python:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

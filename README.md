@@ -1,326 +1,429 @@
 # Orderly Grid Trading Bot
 
-一個企業級的網格交易系統，具備完整的監控、驗證和可靠性功能。專為 Orderly Network 設計的 MVP 實現。
+An enterprise-grade grid trading system designed for Orderly Network with comprehensive monitoring, validation, and reliability features. This MVP implementation provides a robust foundation for automated grid trading strategies.
 
-## 🏗️ 項目結構
+## Architecture Overview
+
+The system follows a modular architecture with clear separation of concerns:
 
 ```
 orderly_bot/
-├── app.py                 # 主程式入口點
-├── requirements.txt       # Python 依賴項
-├── setup.py              # 項目安裝配置
+├── app.py                              # Application entry point
+├── requirements.txt                    # Production dependencies
+├── .env.example                        # Environment configuration template
 ├── src/
-│   ├── api/               # FastAPI 伺服器和端點
-│   │   └── server.py      # API 路由和伺服器設置
-│   ├── core/              # 核心交易邏輯
-│   │   ├── grid_bot.py    # 主要交易機器人實現
-│   │   ├── grid_signal.py # 訊號生成和策略
-│   │   └── client.py      # 交易所 API 客戶端
-│   └── utils/             # 工具和基礎設施
-│       ├── session_manager.py    # 多會話管理
-│       ├── event_queue.py        # 順序事件處理
-│       ├── market_validator.py   # 價格/數量驗證
-│       ├── retry_handler.py      # 彈性 API 調用
-│       ├── order_tracker.py      # 成交追踪
-│       ├── logging_config.py     # 結構化日誌
-│       ├── error_codes.py        # 統一錯誤碼系統
-│       ├── api_helpers.py        # API 輔助工具
-│       └── settings.py           # 環境變數設置
-├── .env.example           # 環境變數模板
-├── .gitignore            # Git 忽略文件
-└── README.md             # 項目文檔（本文件）
+│   ├── api/                           # REST API layer
+│   │   └── server.py                  # FastAPI application and endpoints
+│   ├── core/                          # Core trading logic
+│   │   ├── grid_bot.py                # Main trading bot implementation
+│   │   ├── grid_signal.py             # Signal generation and strategy logic
+│   │   ├── client.py                  # Orderly Network API client
+│   │   └── profit_tracker.py          # Profit/loss tracking
+│   ├── services/                      # Business services layer
+│   │   ├── session_service.py         # Multi-session management
+│   │   ├── database_service.py        # Database operations
+│   │   ├── grid_summary_service.py    # Grid summary analytics
+│   │   └── database_connection.py     # MongoDB connection management
+│   ├── auth/                          # Authentication & authorization
+│   │   ├── wallet_signature.py        # Wallet signature verification
+│   │   └── auth_decorators.py         # Authentication decorators
+│   ├── models/                        # Data models and schemas
+│   │   └── grid_summary.py            # Grid session summary model
+│   ├── utils/                         # Infrastructure utilities
+│   │   ├── session_manager.py         # Session state management
+│   │   ├── event_queue.py             # Ordered event processing
+│   │   ├── market_validator.py        # Price/quantity validation
+│   │   ├── retry_handler.py           # Resilient API calls
+│   │   ├── order_tracker.py           # Order execution tracking
+│   │   ├── logging_config.py          # Structured logging system
+│   │   ├── error_codes.py             # Centralized error handling
+│   │   ├── websocket_manager.py       # WebSocket connection management
+│   │   ├── system_monitor.py          # System health monitoring
+│   │   └── mongodb_health.py          # Database health checks
+│   └── config/                        # Configuration management
+│       └── production_config.py       # Production environment settings
+└── tests/                             # Comprehensive test suite
+    ├── unit/                          # Unit tests
+    ├── integration/                   # Integration tests
+    ├── conftest.py                    # Test configuration
+    └── mocks.py                       # Test utilities
 ```
 
-## 🚀 快速開始
+## Quick Start for Developers
 
-### 1. 環境設置
+### Prerequisites
+
+- Python 3.8+
+- MongoDB 4.4+
+- Orderly Network API credentials
+
+### Environment Setup
 
 ```bash
-# 複製環境變數模板並填入值
+# Clone the repository
+git clone <repository-url>
+cd orderly-bot
+
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Set up environment variables
 cp .env.example .env
-
-# 編輯 .env 文件，填入您的 Orderly Network 憑證
-# ORDERLY_KEY=your_orderly_key
-# ORDERLY_SECRET=your_orderly_secret  
-# ORDERLY_ACCOUNT_ID=your_account_id
+# Edit .env with your credentials
 ```
 
-### 2. 安裝依賴
+### Required Environment Variables
 
 ```bash
-# 方法 1: 使用 requirements.txt
+# Orderly Network credentials (required)
+ORDERLY_KEY=your_orderly_api_key
+ORDERLY_SECRET=your_orderly_secret_key
+ORDERLY_ACCOUNT_ID=your_account_id
+
+# Database connection (required)
+MONGODB_URI=mongodb://localhost:27017/orderly_bot
+
+# Optional configuration
+ORDERLY_TESTNET=true                    # Use testnet (default: true)
+UVICORN_HOST=0.0.0.0                   # Server host (default: 0.0.0.0)
+UVICORN_PORT=8001                      # Server port (default: 8001)
+PYTHONDONTWRITEBYTECODE=1              # Prevent __pycache__ generation
+```
+
+### Installation and Development Setup
+
+```bash
+# Install dependencies
 pip install -r requirements.txt
 
-# 方法 2: 開發模式安裝（推薦）
+# Install in development mode (recommended for contributions)
 pip install -e .
 
-# 方法 3: 手動安裝核心依賴
-pip install fastapi uvicorn httpx pydantic orderly-evm-connector
-```
-
-### 3. 啟動伺服器
-
-```bash
-# 方法 1: 使用 uvicorn（推薦）
-uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
-
-# 方法 2: 使用 Python 入口點
+# Run the application
 python app.py
-
-# 方法 3: 如果已安裝為包
-grid-trading-bot
+# OR
+uvicorn src.api.server:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-### 4. 驗證運行
+### Verify Installation
 
 ```bash
-# 健康檢查
-curl http://localhost:8000/health
+# Health check
+curl http://localhost:8001/health
 
-# 查看系統指標
-curl http://localhost:8000/metrics
+# System metrics
+curl http://localhost:8001/metrics
 
-# 查看 API 文檔
-open http://localhost:8000/docs
+# API documentation
+open http://localhost:8001/docs
 ```
 
-## 📊 API 端點
+## Core Components
 
-### 核心交易端點
-- `POST /api/grid/start` - 啟動網格交易
-- `POST /api/grid/stop` - 停止網格交易
-- `GET /api/grid/status/{session_id}` - 獲取會話狀態
-- `GET /api/grid/sessions` - 列出所有會話
+### 1. Grid Trading Engine (`src/core/grid_bot.py`)
 
-### 用戶管理端點
-- `POST /api/user/enable` - 註冊用戶並啟用機器人交易
-- `PUT /api/user/update` - 更新用戶 API 憑證
+The main trading bot implementation that orchestrates:
+- Multi-session grid trading management
+- Event-driven trading signal execution
+- Order lifecycle management
+- WebSocket integration for real-time updates
+- Profit/loss tracking
 
-### 系統監控端點
-- `GET /health` - 健康檢查
-- `GET /health/ready` - 就緒檢查
-- `GET /metrics` - 系統指標
-- `GET /` - 根端點
+Key features:
+- **Session Management**: Each trading session is isolated with its own state
+- **Event Processing**: Ordered event queue prevents race conditions
+- **Resilient Operations**: Automatic retry mechanisms with exponential backoff
+- **Safety Mechanisms**: Duplicate order prevention and state consistency checks
 
-### 用戶管理端點
-- `POST /api/enable` - 啟用機器人交易（預留）
+### 2. Signal Generation (`src/core/grid_signal.py`)
 
-## 🎯 核心功能
+Implements grid trading strategies with support for:
+- **Grid Types**: Arithmetic (uniform spacing) and Geometric (exponential spacing)
+- **Trading Directions**: LONG, SHORT, or BOTH (bidirectional)
+- **Dynamic Signal Generation**: Event-driven signals based on price movements
 
-### ✅ 交易功能
-- **多會話支援**：同時運行多個網格交易
-- **三種策略**：做多、做空、雙向網格
-- **兩種網格類型**：等差網格（均勻分佈）和等比網格（幾何級數分佈）
-- **智能訊號生成**：事件驅動的交易訊號
-- **訂單追踪**：完整的成交記錄和統計
+### 3. Orderly Client (`src/core/client.py`)
 
-### ✅ 安全性功能
-- **重複掛單防護**：防止同一價格重複掛單
-- **事件去重機制**：防止 WebSocket 重複事件
-- **狀態一致性保護**：API 失敗時自動回滾
-- **併發安全**：使用鎖保護共享狀態
+Wrapper around Orderly Network API providing:
+- Rate-limited API calls (10 requests/second)
+- Automatic error handling and retries
+- Order management and position tracking
+- WebSocket integration for real-time data
 
-### ✅ 可靠性功能
-- **指數退避重試**：智能錯誤分類和重試
-- **順序事件處理**：防止競爭條件
-- **市場驗證**：價格和數量標準化
-- **統一錯誤處理**：結構化錯誤碼系統
+### 4. Session Management (`src/services/session_service.py`)
 
-### ✅ 監控功能
-- **結構化日誌**：JSON 格式，便於分析
-- **系統指標**：計數器、量表、直方圖
-- **健康檢查**：多層次的系統狀態檢查
-- **會話上下文追踪**：完整的操作鏈路追踪
+Manages multiple concurrent trading sessions:
+- Session isolation and state management
+- Resource cleanup and garbage collection
+- Session persistence and recovery
 
-## 🔧 配置說明
+## API Endpoints
 
-### 必要環境變數
+### Trading Operations
+
 ```bash
-MONGODB_URI=mongodb://...                   # MongoDB 連接字符串
-```
-
-### 可選環境變數
-```bash
-ORDERLY_TESTNET=true                        # 是否使用測試網（預設：true）
-UVICORN_HOST=0.0.0.0                       # 伺服器主機（預設：0.0.0.0）
-UVICORN_PORT=8000                          # 伺服器端口（預設：8000）
-PYTHONDONTWRITEBYTECODE=1                  # 防止生成 __pycache__
-```
-
-## 📝 API 使用範例
-
-### 啟動網格交易
-
-#### 等差網格（默認）
-```bash
-curl -X POST "http://localhost:8000/api/grid/start" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ticker": "BTCUSDT",
-    "direction": "BOTH",
-    "current_price": 42500,
-    "upper_bound": 45000,
-    "lower_bound": 40000,
-    "grid_levels": 6,
-    "total_margin": 1000,
+# Start grid trading session
+POST /api/grid/start
+{
+  "ticker": "BTCUSDT",
+  "direction": "BOTH",
+  "current_price": 42500,
+  "upper_bound": 45000,
+  "lower_bound": 40000,
+  "grid_levels": 6,
+  "total_margin": 1000,
+  "grid_type": "ARITHMETIC",  # or "GEOMETRIC"
+  "grid_ratio": 0.05,         # Required for GEOMETRIC grids
+  "user_auth": {
     "user_id": "user123",
-    "user_sig": "signature123",
+    "signature": "wallet_signature",
     "timestamp": 1234567890,
     "nonce": "random_nonce"
-  }'
+  }
+}
+
+# Stop grid trading session
+POST /api/grid/stop
+{
+  "session_id": "user123_BTCUSDT"
+}
+
+# Get session status
+GET /api/grid/status/{session_id}
+
+# List all sessions
+GET /api/grid/sessions
+
+# Get grid summary with filtering
+GET /api/grid/summary?user_id=user123&status=active&start_time=2024-01-01
 ```
 
-#### 等比網格
+### System Monitoring
+
 ```bash
-curl -X POST "http://localhost:8000/api/grid/start" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ticker": "BTCUSDT",
-    "direction": "BOTH",
-    "current_price": 42500,
-    "upper_bound": 45000,
-    "lower_bound": 40000,
-    "grid_levels": 6,
-    "total_margin": 1000,
-    "grid_type": "GEOMETRIC",
-    "grid_ratio": 0.05,
-    "user_id": "user123",
-    "user_sig": "signature123",
-    "timestamp": 1234567890,
-    "nonce": "random_nonce"
-  }'
+# Health check
+GET /health
+
+# Readiness check (includes dependencies)
+GET /health/ready
+
+# System metrics
+GET /metrics
+
+# Root endpoint
+GET /
 ```
 
-### 停止網格交易
+## Grid Trading Strategies
+
+### Arithmetic Grid (Default)
+
+Uniform price distribution between bounds.
+
+**Formula**: `price_interval = (upper_bound - lower_bound) / (grid_levels - 1)`
+
+**Use Case**: Ranging markets with predictable volatility patterns.
+
+### Geometric Grid
+
+Exponential price distribution requiring `grid_ratio` parameter.
+
+**Formulas**:
+- Lower grid: `price = current_price × (1 - grid_ratio)^i`
+- Upper grid: `price = current_price × (1 + grid_ratio)^i`
+
+**Parameters**:
+- `grid_ratio`: 0.01 - 0.1 (1% - 10%)
+
+**Use Case**: Trending markets with exponential price movements.
+
+## Development Workflow
+
+### Running Tests
+
 ```bash
-curl -X POST "http://localhost:8000/api/grid/stop" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "user123_BTCUSDT"
-  }'
-```
-
-### 查詢會話狀態
-```bash
-curl "http://localhost:8000/api/grid/status/user123_BTCUSDT"
-```
-
-## 📊 網格類型說明
-
-### 等差網格（ARITHMETIC）
-等差網格是默認的網格類型，價格點之間的間距相等。
-
-**特點：**
-- 價格分佈均勻
-- 適合震盪行情
-- 風險分散均勻
-
-**計算公式：**
-```
-價格間距 = (上界 - 下界) / (網格層數 - 1)
-第 i 層價格 = 下界 + i × 價格間距
-```
-
-### 等比網格（GEOMETRIC）
-等比網格的價格點按幾何級數分佈，需要指定 `grid_ratio` 參數。
-
-**特點：**
-- 價格分佈呈指數型
-- 適合趨勢行情
-- 在價格變化較大時更靈敏
-
-**計算公式：**
-```
-下方網格：價格 = 當前價格 × (1 - grid_ratio)^i
-上方網格：價格 = 當前價格 × (1 + grid_ratio)^i
-```
-
-**參數要求：**
-- `grid_ratio`：必須大於 0 且小於 1
-- 建議值：0.01 - 0.1（1% - 10%）
-
-## 🧪 測試
-
-### 運行所有測試
-```bash
-# 使用測試運行器（推薦）
+# Run all tests
 python tests/run_tests.py
-
-# 或直接使用 pytest
+# OR
 pytest tests/ -v
-```
 
-### 運行特定測試
-```bash
-# 單元測試
-pytest tests/test_components.py -v
+# Run specific test categories
+pytest tests/unit/ -v                    # Unit tests only
+pytest tests/integration/ -v             # Integration tests
+pytest tests/test_server.py -v           # API tests
+pytest tests/test_grid_safety.py -v      # Security tests
 
-# API 測試
-pytest tests/test_server.py -v
-
-# 安全性測試
-pytest tests/test_grid_safety.py -v
-
-# 集成測試
-pytest tests/test_integration.py --run-integration -v
-```
-
-### 生成覆蓋率報告
-```bash
+# Generate coverage report
 pytest tests/ --cov=src --cov-report=html
 ```
 
-## 🛡️ 安全性特性
+### Code Quality
 
-- **環境變數管理**：敏感資訊通過環境變數管理
-- **輸入驗證**：Pydantic 模型驗證所有輸入
-- **錯誤處理**：統一的錯誤碼和異常處理
-- **併發保護**：防止競爭條件和重複操作
-- **資源清理**：自動清理連接和狀態
+```bash
+# Install development dependencies
+pip install black flake8 mypy
 
-## 📈 監控和日誌
+# Code formatting
+black src/ tests/
 
-### 結構化日誌
-- JSON 格式日誌，便於分析
-- 會話上下文追踪
-- 事件類型分類
-- 錯誤詳情記錄
+# Linting
+flake8 src/ tests/
 
-### 系統指標
-- API 請求計數和成功率
-- 會話創建和停止統計
-- 訂單執行指標
-- 系統性能指標
+# Type checking
+mypy src/
+```
 
-## 🔄 網格交易策略
+### Adding New Features
 
-### 支援的交易方向
-- **LONG（做多）**：只在價格下跌時買入
-- **SHORT（做空）**：只在價格上漲時賣出
-- **BOTH（雙向）**：價格上下波動都進行交易
+1. **Implementation**: Add functionality to appropriate module
+2. **Testing**: Write comprehensive unit and integration tests
+3. **Documentation**: Update API documentation and README
+4. **Validation**: Run full test suite and ensure >90% coverage
+5. **Security**: Review error handling and input validation
 
-### 網格邏輯
-1. **初始掛單**：根據策略在關鍵價格點掛單
-2. **成交觸發**：訂單成交後取消所有掛單
-3. **反向掛單**：在新的價格點掛反向訂單
-4. **循環執行**：持續執行直到停損或手動停止
+## Error Handling and Monitoring
 
-## 🚨 注意事項
+### Structured Logging
 
-- 這是一個 **MVP 實現**，適用於測試和學習
-- 請在測試網環境中充分測試後再考慮主網使用
-- 建議設置適當的停損價格以控制風險
-- 系統會自動處理 Orderly Network 的 API 速率限制（10 requests/second）
+The system uses JSON-structured logging with context tracking:
 
-## 📚 開發指南
+```python
+# Example log entry
+{
+  "timestamp": "2024-01-01T12:00:00Z",
+  "level": "INFO",
+  "session_id": "user123_BTCUSDT",
+  "event_type": "ORDER_CREATED",
+  "message": "Grid order created successfully",
+  "order_id": "order_123",
+  "price": 42500,
+  "quantity": 0.1
+}
+```
 
-### 添加新功能
-1. 在適當的模組中實現功能
-2. 添加相應的測試
-3. 更新文檔
-4. 運行完整測試套件
+### Error Codes
 
-### 調試技巧
-- 使用結構化日誌查看詳細操作
-- 檢查 `/metrics` 端點了解系統狀態
-- 使用 `/health/ready` 檢查系統就緒狀態
+Centralized error handling with specific error codes in `src/utils/error_codes.py`:
+- `SESSION_NOT_FOUND`: Trading session doesn't exist
+- `INVALID_MARKET_PARAMS`: Invalid market parameters
+- `ORDER_CREATION_FAILED`: Order placement failure
+- `RATE_LIMIT_EXCEEDED`: API rate limit exceeded
+
+### System Metrics
+
+Comprehensive metrics collection for monitoring:
+- API request counts and success rates
+- Session creation/deletion statistics
+- Order execution metrics
+- System performance indicators
+- Database connection health
+
+## Security Considerations
+
+### Authentication
+
+- **Wallet Signature Verification**: Cryptographic signature validation
+- **Nonce Prevention**: Replay attack protection
+- **Rate Limiting**: API endpoint protection with SlowAPI
+- **Input Validation**: Pydantic model validation for all inputs
+
+### Safety Mechanisms
+
+- **Duplicate Order Prevention**: Prevents multiple orders at same price
+- **Event Deduplication**: WebSocket event deduplication
+- **State Consistency**: Automatic rollback on API failures
+- **Concurrency Protection**: Asyncio locks for shared state
+
+## Database Schema
+
+### Sessions Collection
+
+```javascript
+{
+  "_id": "user123_BTCUSDT",
+  "user_id": "user123",
+  "ticker": "BTCUSDT",
+  "status": "ACTIVE",
+  "config": {
+    "direction": "BOTH",
+    "grid_type": "ARITHMETIC",
+    "upper_bound": 45000,
+    "lower_bound": 40000,
+    "grid_levels": 6,
+    "total_margin": 1000
+  },
+  "created_at": ISODate("2024-01-01T12:00:00Z"),
+  "updated_at": ISODate("2024-01-01T12:30:00Z")
+}
+```
+
+### Grid Summaries Collection
+
+```javascript
+{
+  "_id": ObjectId("..."),
+  "session_id": "user123_BTCUSDT",
+  "user_id": "user123",
+  "ticker": "BTCUSDT",
+  "total_orders": 25,
+  "successful_orders": 23,
+  "total_profit": 150.50,
+  "stop_reason": "MANUAL",
+  "created_at": ISODate("2024-01-01T12:00:00Z"),
+  "updated_at": ISODate("2024-01-01T12:30:00Z")
+}
+```
+
+## Performance Considerations
+
+### Rate Limiting
+
+- **Orderly API**: 10 requests/second with automatic rate limiting
+- **Application Endpoints**: Configurable rate limits per endpoint
+- **WebSocket**: Connection pooling and reconnection logic
+
+### Resource Management
+
+- **Connection Pooling**: MongoDB connection pooling
+- **Memory Management**: Automatic cleanup of completed sessions
+- **Event Queue**: Bounded queue with backpressure handling
+
+### Scalability
+
+- **Session Isolation**: Each session runs independently
+- **Async Processing**: Non-blocking I/O throughout
+- **Database Indexing**: Optimized queries for session lookups
+
+## Troubleshooting
+
+### Common Issues
+
+1. **WebSocket Connection Failures**
+   - Check network connectivity
+   - Verify Orderly Network credentials
+   - Review rate limiting status
+
+2. **Order Placement Failures**
+   - Insufficient margin
+   - Market price outside grid bounds
+   - API rate limit exceeded
+
+3. **Session State Inconsistencies**
+   - Database connection issues
+   - Concurrent access conflicts
+   - Network interruptions
+
+### Debug Mode
+
+Enable debug logging by setting:
+```bash
+LOG_LEVEL=DEBUG
+```
+
+### Health Monitoring
+
+Monitor system health via:
+- `/health` endpoint for basic status
+- `/health/ready` for dependency checks
+- `/metrics` for detailed performance metrics
