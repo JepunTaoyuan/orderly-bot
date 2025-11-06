@@ -235,10 +235,10 @@ class SessionManager:
     async def stop_session(self, session_id: str) -> bool:
         """
         停止交易會話
-        
+
         Args:
             session_id: 會話ID
-            
+
         Returns:
             是否停止成功
         """
@@ -248,20 +248,43 @@ class SessionManager:
                 # 即使會話不存在，也要清理 _creating_sessions
                 self._creating_sessions.discard(session_id)
                 return False
-            
+
+            bot = self.sessions[session_id]
+            stop_successful = False
+            cleanup_errors = []
+
             try:
-                bot = self.sessions[session_id]
+                # 嘗試正常停止網格交易
                 await bot.stop_grid_trading()
-                del self.sessions[session_id]
-                self._creating_sessions.discard(session_id)
-                logger.info(f"會話 {session_id} 已停止")
-                return True
+                stop_successful = True
+                logger.info(f"會話 {session_id} 正常停止")
             except Exception as e:
-                # 即使停止失敗，也要清理所有相關數據
-                del self.sessions[session_id]
-                self._creating_sessions.discard(session_id)
-                logger.error(f"停止會話 {session_id} 失敗: {e}")
-                raise
+                # 記錄停止錯誤但不重新拋出，因為會話需要被清理
+                cleanup_errors.append(f"停止錯誤: {str(e)}")
+                logger.warning(f"停止會話 {session_id} 時發生錯誤: {e}")
+                # 即使停止失敗，也要繼續清理流程
+            finally:
+                # 無論停止是否成功，都要清理會話數據
+                try:
+                    del self.sessions[session_id]
+                    self._creating_sessions.discard(session_id)
+
+                    if cleanup_errors:
+                        logger.warning(f"會話 {session_id} 已清理，但有 {len(cleanup_errors)} 個警告: {'; '.join(cleanup_errors)}")
+                    else:
+                        logger.info(f"會話 {session_id} 已成功停止並清理")
+
+                    # 如果核心停止功能成功，或即使有警告但會話已清理，都返回 True
+                    return True
+
+                except Exception as cleanup_error:
+                    # 清理本身的錯誤
+                    logger.error(f"清理會話 {session_id} 數據時發生錯誤: {cleanup_error}")
+                    raise GridTradingException(
+                        error_code=ErrorCode.SESSION_STOP_FAILED,
+                        details={"session_id": session_id, "cleanup_error": str(cleanup_error)},
+                        original_error=cleanup_error
+                    )
 
     async def force_cleanup_session(self, session_id: str) -> bool:
         """

@@ -70,8 +70,297 @@ class GridTradingBot:
         self.processed_fills = {}
         self.processed_fills_max_size = self.PROCESSED_FILLS_MAX_SIZE
         self.processed_fills_ttl = self.PROCESSED_FILLS_TTL
-        
-    
+
+        # ⭐ 新增：訂單統計追蹤
+        self.order_statistics = {
+            "signals_received": 0,
+            "signals_processed": 0,
+            "orders_attempted": 0,
+            "orders_created": 0,
+            "orders_failed": 0,
+            "duplicate_prevented": 0,
+            "validation_failed": 0,
+            "api_failed": 0,
+            "last_signal_time": None,
+            "last_order_time": None,
+            "failure_reasons": {}
+        }
+
+        # ⭐ 新增：並發處情況追蹤
+        self.concurrency_stats = {
+            "concurrent_signals": 0,
+            "max_concurrent_signals": 0,
+            "concurrent_orders": 0,
+            "max_concurrent_orders": 0,
+            "lock_contentions": 0,
+            "lock_wait_time": 0,
+            "concurrent_events": 0,
+            "processing_collisions": 0,
+            "signal_queue_overflows": 0
+        }
+
+        # 追蹤當前正在處理的信號和訂單
+        self._processing_signals = set()
+        self._processing_orders = set()
+        self._lock_acquisition_times = {}
+
+        # ⭐ 新增：精確的訂單去重追蹤
+        self._order_dedup_tracker = {
+            "price_to_order": {},        # 價格到訂單ID的映射
+            "order_timestamps": {},      # 訂單創建時間戳
+            "pending_orders": {},        # 處理中訂單的詳細信息
+            "expired_orders": set(),     # 已過期訂單ID集合
+            "order_age_limit": 300,      # 訂單追蹤時間限制（秒）
+            "price_tolerance": 1e-8      # 價格匹配容差
+        }
+
+    @staticmethod
+    def _track_concurrency(operation_type: str):
+        """並發處理追蹤裝飾器"""
+        def decorator(func):
+            async def wrapper(*args, **kwargs):
+                # 獲取self實例
+                if args:
+                    instance = args[0]
+                else:
+                    raise ValueError("Missing self argument in decorated method")
+
+                operation_id = f"{operation_type}_{time.time()}_{id(args)}"
+                start_time = time.time()
+
+                if operation_type == "signal":
+                    instance._processing_signals.add(operation_id)
+                    current_concurrent = len(instance._processing_signals)
+                    instance.concurrency_stats["concurrent_signals"] = current_concurrent
+                    if current_concurrent > instance.concurrency_stats["max_concurrent_signals"]:
+                        instance.concurrency_stats["max_concurrent_signals"] = current_concurrent
+
+                    # 檢測信號處理碰撞
+                    if current_concurrent > 1:
+                        instance.concurrency_stats["processing_collisions"] += 1
+                        logger.warning(f"檢測到並發信號處理: {current_concurrent} 個信號同時處理",
+                                     event_type="concurrent_signals_detected", data={
+                                         "concurrent_count": current_concurrent,
+                                         "operation_id": operation_id
+                                     })
+
+                elif operation_type == "order":
+                    instance._processing_orders.add(operation_id)
+                    current_concurrent = len(instance._processing_orders)
+                    instance.concurrency_stats["concurrent_orders"] = current_concurrent
+                    if current_concurrent > instance.concurrency_stats["max_concurrent_orders"]:
+                        instance.concurrency_stats["max_concurrent_orders"] = current_concurrent
+
+                try:
+                    result = await func(*args, **kwargs)
+                    return result
+
+                finally:
+                    # 清理處理記錄
+                    if operation_type == "signal" and operation_id in instance._processing_signals:
+                        instance._processing_signals.remove(operation_id)
+                    elif operation_type == "order" and operation_id in instance._processing_orders:
+                        instance._processing_orders.remove(operation_id)
+
+                    processing_time = time.time() - start_time
+
+                    # 記錄並發處理統計
+                    if operation_type == "signal":
+                        logger.debug(f"信號處理完成: {operation_id}, 處理時間: {processing_time:.3f}s",
+                                   event_type="signal_processing_completed", data={
+                                       "operation_id": operation_id,
+                                       "processing_time": processing_time,
+                                       "concurrent_signals": len(instance._processing_signals)
+                                   })
+                    elif operation_type == "order":
+                        logger.debug(f"訂單處理完成: {operation_id}, 處理時間: {processing_time:.3f}s",
+                                   event_type="order_processing_completed", data={
+                                       "operation_id": operation_id,
+                                       "processing_time": processing_time,
+                                       "concurrent_orders": len(instance._processing_orders)
+                                   })
+
+            return wrapper
+        return decorator
+
+    async def _track_lock_contention(self, lock_name: str):
+        """追蹤鎖競爭情況"""
+        start_time = time.time()
+        try:
+            # 這裡我們模擬鎖獲取，實際的鎖操作在具體方法中
+            self._lock_acquisition_times[lock_name] = start_time
+        except Exception as e:
+            wait_time = time.time() - start_time
+            self.concurrency_stats["lock_contentions"] += 1
+            self.concurrency_stats["lock_wait_time"] += wait_time
+
+            logger.warning(f"檢測到鎖競爭: {lock_name}, 等待時間: {wait_time:.3f}s",
+                         event_type="lock_contention", data={
+                             "lock_name": lock_name,
+                             "wait_time": wait_time,
+                             "total_contentions": self.concurrency_stats["lock_contentions"]
+                         })
+
+    def get_concurrency_statistics(self) -> Dict[str, Any]:
+        """獲取並發處理統計"""
+        stats = self.concurrency_stats.copy()
+
+        # 計算平均鎖等待時間
+        if stats["lock_contentions"] > 0:
+            stats["avg_lock_wait_time"] = stats["lock_wait_time"] / stats["lock_contentions"]
+        else:
+            stats["avg_lock_wait_time"] = 0
+
+        # 計算當前並發狀態
+        stats["current_concurrent_signals"] = len(self._processing_signals)
+        stats["current_concurrent_orders"] = len(self._processing_orders)
+
+        # 添加活躍處理列表
+        stats["active_signal_operations"] = list(self._processing_signals)
+        stats["active_order_operations"] = list(self._processing_orders)
+
+        return stats
+
+    def _is_duplicate_order(self, price: float, side: str) -> tuple[bool, str]:
+        """
+        ⭐ 新增：精確的重複訂單檢查邏輯
+
+        Args:
+            price: 訂單價格
+            side: 訂單方向
+
+        Returns:
+            (is_duplicate, reason): 是否重複及原因
+        """
+        current_time = time.time()
+        price_key = f"{price}_{side}"  # 使用價格+方向作為唯一鍵
+
+        # 清理過期的訂單記錄
+        self._cleanup_expired_orders(current_time)
+
+        # 檢查是否有相同價格的處理中訂單
+        if price_key in self._order_dedup_tracker["pending_orders"]:
+            pending_info = self._order_dedup_tracker["pending_orders"][price_key]
+            age = current_time - pending_info["timestamp"]
+
+            # 如果處理中訂單超過5秒，認為可能失敗了，允許重試
+            if age > 5:
+                logger.info(f"處理中訂單已超時，允許重試: {price_key}, 年齡: {age:.1f}s",
+                           event_type="pending_order_expired", data={
+                               "price_key": price_key,
+                               "age": age
+                           })
+                # 清理過期的處理中記錄
+                del self._order_dedup_tracker["pending_orders"][price_key]
+                return False, "pending_order_expired"
+            else:
+                return True, f"order_pending_processing_{age:.1f}s"
+
+        # 檢查是否有相同價格的現有訂單
+        if price_key in self._order_dedup_tracker["price_to_order"]:
+            order_id = self._order_dedup_tracker["price_to_order"][price_key]
+
+            # 檢查訂單是否還在活躍狀態
+            if order_id in self._order_dedup_tracker["order_timestamps"]:
+                order_age = current_time - self._order_dedup_tracker["order_timestamps"][order_id]
+
+                # 如果訂單年齡小於追蹤期限，檢查是否在活躍訂單中
+                if order_age < self._order_dedup_tracker["order_age_limit"]:
+                    if order_id in self.active_orders:
+                        return True, f"active_order_exists_{order_id}"
+                    else:
+                        # 訂單不在活躍列表中，可能已成交或取消，清理記錄
+                        logger.debug(f"清理不活躍訂單記錄: {order_id}")
+                        del self._order_dedup_tracker["price_to_order"][price_key]
+                        del self._order_dedup_tracker["order_timestamps"][order_id]
+                else:
+                    # 訂單過期，清理記錄
+                    logger.debug(f"清理過期訂單記錄: {order_id}, 年齡: {order_age:.1f}s")
+                    del self._order_dedup_tracker["price_to_order"][price_key]
+                    del self._order_dedup_tracker["order_timestamps"][order_id]
+                    self._order_dedup_tracker["expired_orders"].add(order_id)
+
+        # 檢查價格相近的訂單（防止浮點數精度問題）
+        tolerance = self._order_dedup_tracker["price_tolerance"]
+        for existing_price_key, existing_order_id in self._order_dedup_tracker["price_to_order"].items():
+            try:
+                existing_price_str = existing_price_key.split("_")[0]
+                existing_price = float(existing_price_str)
+                existing_side = existing_price_key.split("_")[1]
+
+                if existing_side == side and abs(existing_price - price) <= tolerance:
+                    # 找到價格相近的訂單
+                    if existing_order_id in self.active_orders:
+                        return True, f"similar_price_order_exists_{existing_order_id}_{existing_price}"
+            except (ValueError, IndexError):
+                continue
+
+        return False, "no_duplicate"
+
+    def _cleanup_expired_orders(self, current_time: float):
+        """清理過期的訂單記錄"""
+        age_limit = self._order_dedup_tracker["order_age_limit"]
+
+        # 清理過期的處理中訂單
+        expired_pending = []
+        for price_key, info in self._order_dedup_tracker["pending_orders"].items():
+            if current_time - info["timestamp"] > 10:  # 處理中訂單10秒超時
+                expired_pending.append(price_key)
+
+        for price_key in expired_pending:
+            del self._order_dedup_tracker["pending_orders"][price_key]
+            logger.debug(f"清理過期處理訂單: {price_key}")
+
+        # 清理過期的訂單時間戳
+        expired_timestamps = []
+        for order_id, timestamp in self._order_dedup_tracker["order_timestamps"].items():
+            if current_time - timestamp > age_limit:
+                expired_timestamps.append(order_id)
+
+        for order_id in expired_timestamps:
+            del self._order_dedup_tracker["order_timestamps"][order_id]
+            # 同時清理價格映射
+            for price_key, oid in list(self._order_dedup_tracker["price_to_order"].items()):
+                if oid == order_id:
+                    del self._order_dedup_tracker["price_to_order"][price_key]
+                    break
+
+            self._order_dedup_tracker["expired_orders"].add(order_id)
+
+    def _register_order_creation(self, price: float, side: str, order_id: int):
+        """註冊新創建的訂單"""
+        current_time = time.time()
+        price_key = f"{price}_{side}"
+
+        # 註冊價格到訂單的映射
+        self._order_dedup_tracker["price_to_order"][price_key] = order_id
+
+        # 註冊訂單時間戳
+        self._order_dedup_tracker["order_timestamps"][order_id] = current_time
+
+        # 清理處理中記錄
+        if price_key in self._order_dedup_tracker["pending_orders"]:
+            del self._order_dedup_tracker["pending_orders"][price_key]
+
+        logger.debug(f"註冊訂單創建: {price_key} -> {order_id}")
+
+    def _register_pending_order(self, price: float, side: str):
+        """註冊處理中訂單"""
+        current_time = time.time()
+        price_key = f"{price}_{side}"
+
+        self._order_dedup_tracker["pending_orders"][price_key] = {
+            "timestamp": current_time,
+            "price": price,
+            "side": side
+        }
+
+    def _remove_pending_order(self, price: float, side: str):
+        """移除處理中訂單"""
+        price_key = f"{price}_{side}"
+        if price_key in self._order_dedup_tracker["pending_orders"]:
+            del self._order_dedup_tracker["pending_orders"][price_key]
+
     def _convert_side(self, side: OrderSide) -> str:
         """將訊號生成器的方向轉換為 Orderly 格式"""
         return "BUY" if side == OrderSide.BUY else "SELL"
@@ -105,36 +394,65 @@ class GridTradingBot:
             def on_close(_):
                 logger.warning("WebSocket 連接已關閉")
 
-                # 更新連接狀態
-                if self.session_id:
-                    asyncio.create_task(self._update_ws_state(WSConnectionState.DISCONNECTED))
+                # 更新連接狀態（線程安全）
+                if self.session_id and self.main_loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._update_ws_state(WSConnectionState.DISCONNECTED),
+                            self.main_loop
+                        )
+                    except Exception as e:
+                        logger.error(f"更新 WebSocket 狀態失敗: {e}")
 
                 # 如果機器人還在運行且應該重連，則觸發重連
                 if self.is_running and self.ws_should_reconnect:
                     logger.info("檢測到 WebSocket 意外關閉，準備重連")
-                    # 使用 asyncio 調度重連任務
-                    if self.ws_reconnect_task is None or self.ws_reconnect_task.done():
-                        loop = asyncio.get_event_loop()
-                        self.ws_reconnect_task = loop.create_task(self._handle_ws_reconnect())
+                    # 使用線程安全的方式調度重連任務
+                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()) and self.main_loop:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_ws_reconnect(),
+                                self.main_loop
+                            )
+                        except Exception as e:
+                            logger.error(f"觸發 WebSocket 重連失敗: {e}")
 
             def on_error(_, error):
                 """WebSocket 錯誤處理"""
                 logger.error(f"WebSocket 錯誤: {error}", event_type="websocket_error")
                 if "authentication" in str(error).lower() or "auth" in str(error).lower():
                     logger.critical("WebSocket 認證失敗，停止交易")
-                    asyncio.create_task(self.stop_grid_trading())
+                    if self.main_loop:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self.stop_grid_trading(),
+                                self.main_loop
+                            )
+                        except Exception as e:
+                            logger.error(f"停止交易失敗: {e}")
                     return
 
-                # 更新連接狀態為失敗
-                if self.session_id:
-                    asyncio.create_task(self._update_ws_state(WSConnectionState.FAILED))
+                # 更新連接狀態為失敗（線程安全）
+                if self.session_id and self.main_loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._update_ws_state(WSConnectionState.FAILED),
+                            self.main_loop
+                        )
+                    except Exception as e:
+                        logger.error(f"更新 WebSocket 狀態失敗: {e}")
 
                 # 其他錯誤觸發重連
                 if self.is_running and self.ws_should_reconnect:
                     logger.info("WebSocket 錯誤，準備重連")
-                    if self.ws_reconnect_task is None or self.ws_reconnect_task.done():
-                        loop = asyncio.get_event_loop()
-                        self.ws_reconnect_task = loop.create_task(self._handle_ws_reconnect())
+                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()) and self.main_loop:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_ws_reconnect(),
+                                self.main_loop
+                            )
+                        except Exception as e:
+                            logger.error(f"觸發 WebSocket 重連失敗: {e}")
 
             def on_message(_, message):
                 """處理 WebSocket 訊息"""
@@ -307,25 +625,26 @@ class GridTradingBot:
                 # 等待後重試
                 if attempt > 1:
                     await asyncio.sleep(delay)
-                
+
                 # 重新設置 WebSocket
-                self._setup_websocket(
+                await self._setup_websocket(
                     account_id=self.ws_credentials['account_id'],
                     orderly_key=self.ws_credentials['orderly_key'],
                     orderly_secret=self.ws_credentials['orderly_secret'],
                     orderly_testnet=self.ws_credentials['orderly_testnet']
                 )
-                
+
                 if not self.wss_client:
                     raise Exception("WebSocket 客戶端創建失敗")
-                
-                # 啟動連線並訂閱通知
+
+                # 啟動連線並訂閱通知（作為背景任務）
                 if hasattr(self.wss_client, "run"):
-                    await self.wss_client.run()
+                    # 以背景任務方式運行 WebSocket，避免阻塞
+                    asyncio.create_task(self.wss_client.run())
                 else:
                     logger.warning("WebSocket 客戶端缺少 run()，可能無法啟動連線")
                 self.wss_client.get_notifications()
-                
+
                 logger.info(f"WebSocket 重連成功（嘗試 {attempt} 次）")
                 
                 # 重置重連計數器
@@ -537,19 +856,69 @@ class GridTradingBot:
     
 
     
+    @_track_concurrency("order")
     async def _create_grid_order(self, price: float, side: str):
         """創建網格訂單"""
+        start_time = time.time()
         try:
+            # ⭐ 新增：統計訂單嘗試
+            self.order_statistics["orders_attempted"] += 1
+
+            # ⭐ 新增：追蹤鎖競爭
+            lock_start = time.time()
+            try:
+                await self._track_lock_contention("orders_lock")
+            except:
+                pass  # 忽略追蹤錯誤
+
             async with self._orders_lock:
-                if price in self.grid_orders:
-                    existing_order_id = self.grid_orders[price]
-                    if existing_order_id != "PENDING":
-                        logger.warning(f"價格 {price} 已有掛單 {existing_order_id}，跳過重複掛單")
-                        return
+                lock_acquired_time = time.time() - lock_start
+                if lock_acquired_time > 0.01:  # 如果鎖等待超過10ms
+                    logger.debug(f"訂單鎖獲取耗時: {lock_acquired_time:.3f}s",
+                               event_type="lock_acquisition_time", data={
+                                   "lock_name": "orders_lock",
+                                   "wait_time": lock_acquired_time
+                               })
+
+                # ⭐ 新增：使用精確的去重檢查
+                is_duplicate, duplicate_reason = self._is_duplicate_order(price, side)
+
+                if is_duplicate:
+                    # 統計重複訂單預防
+                    self.order_statistics["duplicate_prevented"] += 1
+                    self._record_failure_reason("duplicate_order", duplicate_reason)
+
+                    # 檢查是否是舊的grid_orders記錄需要清理
+                    if price in self.grid_orders:
+                        old_order_id = self.grid_orders[price]
+                        if old_order_id == "PENDING" or old_order_id not in self.active_orders:
+                            # 清理無效的舊記錄
+                            del self.grid_orders[price]
+                            logger.debug(f"清理無效的grid_orders記錄: {price} -> {old_order_id}")
+                        else:
+                            # 有有效的現有訂單，跳過
+                            logger.warning(f"檢測到重複訂單: {duplicate_reason}",
+                                         event_type="duplicate_order_detected", data={
+                                             "price": price,
+                                             "side": side,
+                                             "reason": duplicate_reason,
+                                             "existing_order_id": old_order_id,
+                                             "duplicates_prevented": self.order_statistics["duplicate_prevented"]
+                                         })
+                            return
                     else:
-                        logger.warning(f"價格 {price} 正在處理中，跳過")
+                        # 在去重追蹤器中找到重複但不在grid_orders中，跳過
+                        logger.warning(f"檢測到重複訂單: {duplicate_reason}",
+                                     event_type="duplicate_order_detected", data={
+                                         "price": price,
+                                         "side": side,
+                                         "reason": duplicate_reason,
+                                         "duplicates_prevented": self.order_statistics["duplicate_prevented"]
+                                     })
                         return
-                
+
+                # ⭐ 新增：註冊處理中訂單
+                self._register_pending_order(price, side)
                 self.grid_orders[price] = "PENDING"
             
             # ⭐ 使用固定數量
@@ -563,24 +932,41 @@ class GridTradingBot:
                     )
                     price, quantity = float(norm_price), float(norm_quantity)
                 except ValidationError as e:
-                    logger.error(f"訂單驗證失敗: {e}")
+                    # ⭐ 新增：統計驗證失敗
+                    self.order_statistics["validation_failed"] += 1
+                    reason = f"訂單驗證失敗: {e}"
+                    self._record_failure_reason("validation_error", reason)
+
+                    logger.error(f"訂單驗證失敗: {e}",
+                               event_type="order_validation_failed", data={
+                                   "price": price,
+                                   "quantity": quantity,
+                                   "error": str(e),
+                                   "validation_failures": self.order_statistics["validation_failed"]
+                               })
                     async with self._orders_lock:
                         self.grid_orders.pop(price, None)
                     return
             
             # 創建限價訂單
-            symbol = self.market_info.symbol 
+            symbol = self.market_info.symbol
+            api_start_time = time.time()
             response = await self.client.create_limit_order(
                 symbol=symbol,
                 side=side,
                 price=price,
                 quantity=quantity
             )
-            
+            api_response_time = time.time() - api_start_time
+
             async with self._orders_lock:
                 if response.get('success', True):
                     order_id = response.get('data', {}).get('order_id')
                     if order_id:
+                        # ⭐ 新增：統計成功創建訂單
+                        self.order_statistics["orders_created"] += 1
+                        self.order_statistics["last_order_time"] = time.time()
+
                         self.active_orders[order_id] = {
                             "price": price,
                             "side": side,
@@ -588,7 +974,10 @@ class GridTradingBot:
                             "order_type": "LIMIT"  # 標記為限價單
                         }
                         self.grid_orders[price] = order_id
-                        
+
+                        # ⭐ 新增：註冊訂單到去重追蹤器
+                        self._register_order_creation(price, side, order_id)
+
                         self.order_tracker.add_order(
                             order_id=order_id,
                             symbol=symbol,
@@ -597,20 +986,113 @@ class GridTradingBot:
                             price=Decimal(str(price)),
                             quantity=Decimal(str(quantity))
                         )
-                        
-                        logger.info(f"網格訂單創建成功: ID={order_id}, 價格={price}, 方向={side}")
+
+                        total_processing_time = time.time() - start_time
+                        success_rate = (self.order_statistics["orders_created"] /
+                                      max(self.order_statistics["orders_attempted"], 1)) * 100
+
+                        logger.info(f"網格訂單創建成功: ID={order_id}, 價格={price}, 方向={side}",
+                                   event_type="order_created", data={
+                                       "order_id": order_id,
+                                       "price": price,
+                                       "side": side,
+                                       "quantity": quantity,
+                                       "api_response_time": api_response_time,
+                                       "total_processing_time": total_processing_time,
+                                       "orders_created": self.order_statistics["orders_created"],
+                                       "orders_attempted": self.order_statistics["orders_attempted"],
+                                       "success_rate": f"{success_rate:.1f}%"
+                                   })
                     else:
-                        logger.error(f"API 響應中缺少 order_id: {response}")
+                        # ⭐ 新增：統計API失敗
+                        self.order_statistics["api_failed"] += 1
+                        reason = f"API 響應中缺少 order_id: {response}"
+                        self._record_failure_reason("missing_order_id", reason)
+
+                        logger.error(f"API 響應中缺少 order_id: {response}",
+                                   event_type="api_response_missing_order_id", data={
+                                       "price": price,
+                                       "side": side,
+                                       "response": response,
+                                       "api_failures": self.order_statistics["api_failed"]
+                                   })
                         self.grid_orders.pop(price, None)
                 else:
-                    logger.error(f"創建訂單失敗: {response}")
+                    # ⭐ 新增：統計API失敗
+                    self.order_statistics["api_failed"] += 1
+                    reason = f"創建訂單失敗: {response}"
+                    self._record_failure_reason("api_rejection", reason)
+
+                    logger.error(f"創建訂單失敗: {response}",
+                               event_type="order_creation_failed", data={
+                                   "price": price,
+                                   "side": side,
+                                   "response": response,
+                                   "api_failures": self.order_statistics["api_failed"],
+                                   "api_response_time": api_response_time
+                               })
                     self.grid_orders.pop(price, None)
             
         except Exception as e:
-            logger.error(f"創建網格訂單失敗: {e}")
+            # ⭐ 新增：統計異常失敗
+            self.order_statistics["orders_failed"] += 1
+            reason = f"創建網格訂單異常: {e}"
+            self._record_failure_reason("exception", reason)
+
+            logger.error(f"創建網格訂單失敗: {e}",
+                       event_type="order_creation_exception", data={
+                           "price": price,
+                           "side": side,
+                           "error": str(e),
+                           "exceptions": self.order_statistics["orders_failed"],
+                           "processing_time": time.time() - start_time
+                       })
             async with self._orders_lock:
                 self.grid_orders.pop(price, None)
-    
+                # ⭐ 新增：清理處理中訂單記錄
+                self._remove_pending_order(price, side)
+
+    def _record_failure_reason(self, reason_type: str, reason: str):
+        """記錄失敗原因用於分析"""
+        if reason_type not in self.order_statistics["failure_reasons"]:
+            self.order_statistics["failure_reasons"][reason_type] = {
+                "count": 0,
+                "last_reason": "",
+                "last_time": None
+            }
+
+        self.order_statistics["failure_reasons"][reason_type]["count"] += 1
+        self.order_statistics["failure_reasons"][reason_type]["last_reason"] = reason
+        self.order_statistics["failure_reasons"][reason_type]["last_time"] = time.time()
+
+    def get_order_statistics(self) -> Dict[str, Any]:
+        """獲取訂單統計信息"""
+        stats = self.order_statistics.copy()
+
+        # 計算成功率
+        if stats["orders_attempted"] > 0:
+            stats["success_rate"] = (stats["orders_created"] / stats["orders_attempted"]) * 100
+            stats["failure_rate"] = ((stats["orders_failed"] + stats["api_failed"] +
+                                   stats["validation_failed"] + stats["duplicate_prevented"]) /
+                                   stats["orders_attempted"]) * 100
+        else:
+            stats["success_rate"] = 0
+            stats["failure_rate"] = 0
+
+        # 計算信號處理率
+        if stats["signals_received"] > 0:
+            stats["signal_processing_rate"] = (stats["signals_processed"] / stats["signals_received"]) * 100
+        else:
+            stats["signal_processing_rate"] = 0
+
+        # 計算運行時間
+        if stats["last_signal_time"] and stats["last_order_time"]:
+            stats["last_signal_to_order_delay"] = stats["last_order_time"] - stats["last_signal_time"]
+        else:
+            stats["last_signal_to_order_delay"] = None
+
+        return stats
+
     async def _event_handler(self, event: Event):
         """統一事件處理器"""
         try:
@@ -629,11 +1111,23 @@ class GridTradingBot:
         else:
             await self._handle_signal_event(signal)
     
+    @_track_concurrency("signal")
     async def _handle_signal_event(self, signal: TradingSignal):
         """實際處理交易訊號"""
         try:
-            logger.info(f"處理訊號: {signal.symbol} {signal.side.value} @ {signal.price} 數量:{signal.size}")
-            
+            # ⭐ 新增：統計信號接收
+            self.order_statistics["signals_received"] += 1
+            self.order_statistics["last_signal_time"] = time.time()
+
+            logger.info(f"處理訊號: {signal.symbol} {signal.side.value} @ {signal.price} 數量:{signal.size}",
+                       event_type="signal_received", data={
+                           "signal_type": signal.signal_type,
+                           "side": signal.side.value,
+                           "price": float(signal.price),
+                           "size": float(signal.size),
+                           "signals_total": self.order_statistics["signals_received"]
+                       })
+
             if not self.is_running:
                 logger.warning("機器人未運行，忽略訊號")
                 return
@@ -655,9 +1149,16 @@ class GridTradingBot:
                 
             elif signal.signal_type == "CANCEL_ALL":
                 await self._handle_cancel_all_signal(orderly_symbol)
-                
+
+            # ⭐ 新增：統計信號成功處理
+            self.order_statistics["signals_processed"] += 1
+
         except Exception as e:
-            logger.error(f"處理訊號失敗: {e}")
+            logger.error(f"處理訊號失敗: {e}", event_type="signal_processing_error", data={
+                "signal_type": getattr(signal, 'signal_type', 'unknown'),
+                "error": str(e),
+                "signals_processed": self.order_statistics.get("signals_processed", 0)
+            })
     
     async def _handle_market_open_signal(self, signal: TradingSignal, symbol: str, side: str):
         """處理市價開倉訊號"""
@@ -991,15 +1492,19 @@ class GridTradingBot:
 
             # ⭐ 新增：記錄開始時間
             self.start_time = datetime.utcnow()
+            print("test0")
 
             # ⭐ 新增：初始化網格總結服務
             from src.services.database_connection import db_manager
             from src.services.grid_summary_service import GridSummaryService
             database = await db_manager.get_database()
+            print("test1")
             self.grid_summary_service = GridSummaryService(database)
+            print("test2")
 
             # 確保索引存在
             await self.grid_summary_service.ensure_indexes()
+            print("test3")
             logger.info("網格總結服務已初始化")
             
             # 創建並啟動事件隊列
@@ -1009,30 +1514,40 @@ class GridTradingBot:
             )
             logger.info("事件隊列已初始化")
             await self.event_queue.start()
-            
+
             # 設置 WebSocket 連接
-            self._setup_websocket(
+            await self._setup_websocket(
                 account_id=config['orderly_account_id'],
                 orderly_key=config['orderly_key'],
                 orderly_secret=config['orderly_secret'],
                 orderly_testnet=config['orderly_testnet']
             )
+
+            # 驗證 WebSocket 客戶端是否成功創建
+            if not self.wss_client:
+                error_msg = "WebSocket 客戶端初始化失敗，無法啟動網格交易"
+                logger.error(error_msg, event_type="websocket_init_failed")
+                raise Exception(error_msg)
+
             logger.info("WebSocket 客戶端已初始化")
 
             # 啟用 WebSocket 重連
             self.ws_should_reconnect = True
             self.ws_reconnect_attempts = 0
-            
-            # 啟動 WebSocket 連線並監聽
+
+            # 啟動 WebSocket 連線並監聽（作為背景任務）
             try:
                 if hasattr(self.wss_client, "run"):
-                    await self.wss_client.run()
+                    # 以背景任務方式運行 WebSocket，避免阻塞主流程
+                    asyncio.create_task(self.wss_client.run())
+                    logger.info("WebSocket 背景任務已啟動")
                 else:
                     logger.warning("WebSocket 客戶端缺少 run()，可能無法啟動連線")
                 self.wss_client.get_notifications()
-                logger.info("WebSocket 啟動並訂閱 notifications 成功")
+                logger.info("WebSocket 訂閱 notifications 成功")
             except Exception as e:
                 logger.error(f"WebSocket 啟動或訂閱 notifications 失敗: {e}")
+                # 注意：這裡不直接拋出異常，允許機器人繼續運行（稍後會重連）
             
             # 創建訊號生成器（⭐ 使用新的固定數量版本）
             self.signal_generator = GridSignalGenerator(
@@ -1077,10 +1592,13 @@ class GridTradingBot:
         """停止網格交易"""
         logger.info("停止網格交易機器人", data={"stop_reason": stop_reason.value})
 
+        # 收集所有清理過程中的錯誤
+        cleanup_errors = []
+
         # 禁用 WebSocket 重連
         self.ws_should_reconnect = False
 
-        # 🛠️ 長期解決方案：安全地處理 WebSocket 重連任務
+        # 🛠️ 安全地處理 WebSocket 重連任務
         if self.ws_reconnect_task:
             if not self.ws_reconnect_task.done():
                 logger.info("正在停止 WebSocket 重連任務...")
@@ -1090,37 +1608,55 @@ class GridTradingBot:
                     await asyncio.wait_for(self.ws_reconnect_task, timeout=2.0)
                     logger.info("WebSocket 重連任務已停止")
                 except asyncio.TimeoutError:
+                    cleanup_errors.append("WebSocket 重連任務停止超時")
                     logger.warning("WebSocket 重連任務停止超時，跳過")
                 except asyncio.CancelledError:
                     logger.info("WebSocket 重連任務已取消")
                 except Exception as e:
+                    cleanup_errors.append(f"WebSocket 重連任務停止錯誤: {str(e)}")
                     logger.warning(f"停止 WebSocket 重連任務時發生錯誤: {e}")
 
             # 清除引用
             self.ws_reconnect_task = None
 
+        # 停止信號生成器
         if self.signal_generator:
-            await self.signal_generator.stop_by_signal()
+            try:
+                await self.signal_generator.stop_by_signal()
+            except Exception as e:
+                cleanup_errors.append(f"信號生成器停止錯誤: {str(e)}")
+                logger.warning(f"停止信號生成器時發生錯誤: {e}")
 
+        # 停止事件隊列
         if self.event_queue:
-            await self.event_queue.stop()
-            self.event_queue = None
+            try:
+                await self.event_queue.stop()
+                self.event_queue = None
+            except Exception as e:
+                cleanup_errors.append(f"事件隊列停止錯誤: {str(e)}")
+                logger.warning(f"停止事件隊列時發生錯誤: {e}")
 
+        # 清理訂單追蹤器
         if self.order_tracker:
             self.order_tracker.clear()
 
+        # 清理已處理的成交記錄
         if self.processed_fills:
             self.processed_fills.clear()
 
-        # 🛡️ 安全改進：如果還有 market_info，使用安全取消方式
-        if self.market_info:
-            await self._handle_cancel_all_signal(self.market_info.symbol)
-        else:
-            # 後備方案：取消所有訂單（這種情況應該很少見）
-            logger.warning("缺少 market_info，使用後備方案取消所有訂單")
-            await self.client.cancel_all_orders()
+        # 🛡️ 安全改進：取消所有訂單
+        try:
+            if self.market_info:
+                await self._handle_cancel_all_signal(self.market_info.symbol)
+            else:
+                # 後備方案：取消所有訂單（這種情況應該很少見）
+                logger.warning("缺少 market_info，使用後備方案取消所有訂單")
+                await self.client.cancel_all_orders()
+        except Exception as e:
+            cleanup_errors.append(f"取消訂單錯誤: {str(e)}")
+            logger.warning(f"取消訂單時發生錯誤: {e}")
 
-        # 🔄 新增：自動平倉邏輯 - 在取消訂單後檢查並平倉
+        # 🔄 自動平倉邏輯 - 非關鍵操作，失敗不影響停止流程
         if self.market_info:
             try:
                 logger.info(f"檢查 {self.market_info.symbol} 的持倉狀態...")
@@ -1137,37 +1673,56 @@ class GridTradingBot:
                                 if close_result.get('success'):
                                     logger.info(f"持倉已成功平倉: {position_qty}")
                                 else:
+                                    cleanup_errors.append(f"平倉失敗: {close_result.get('message', '未知錯誤')}")
                                     logger.warning(f"平倉失敗: {close_result.get('message', '未知錯誤')}")
                                 break
                     else:
                         logger.info(f"{self.market_info.symbol} 無持倉，無需平倉")
                 else:
+                    cleanup_errors.append("無法獲取持倉信息進行平倉檢查")
                     logger.warning("無法獲取持倉信息")
 
             except Exception as e:
-                logger.error(f"檢查或平倉時發生錯誤: {e}")
-                # 平倉失敗不影響停止流程的其他部分
+                cleanup_errors.append(f"檢查或平倉時發生錯誤: {str(e)}")
+                logger.warning(f"檢查或平倉時發生錯誤: {e}")
 
+        # 關閉 WebSocket 連接
         if self.wss_client:
-            await self._safe_close_ws()
+            try:
+                await self._safe_close_ws()
+            except Exception as e:
+                cleanup_errors.append(f"WebSocket 關閉錯誤: {str(e)}")
+                logger.warning(f"關閉 WebSocket 連接時發生錯誤: {e}")
 
-        # ⭐ 新增：保存網格總結數據
+        # ⭐ 保存網格總結數據 - 非關鍵操作
         try:
             await self._save_grid_summary(stop_reason)
         except Exception as e:
-            logger.error(f"保存網格總結時發生錯誤: {e}")
+            cleanup_errors.append(f"保存網格總結錯誤: {str(e)}")
+            logger.warning(f"保存網格總結時發生錯誤: {e}")
 
+        # 設置運行狀態為停止
         self.is_running = False
-        logger.info("網格交易機器人已停止", event_type="bot_stopped", data={"stop_reason": stop_reason.value})
+
+        # 記錄最終結果
+        if cleanup_errors:
+            logger.warning(f"網格交易機器人已停止，但有 {len(cleanup_errors)} 個警告: {'; '.join(cleanup_errors)}",
+                          event_type="bot_stopped_with_warnings",
+                          data={"stop_reason": stop_reason.value, "warnings": cleanup_errors})
+        else:
+            logger.info("網格交易機器人已成功停止",
+                       event_type="bot_stopped",
+                       data={"stop_reason": stop_reason.value})
     
     async def get_status(self):
-        """獲取機器人狀態（包含利潤統計）"""
+        """獲取機器人狀態（包含利潤統計和訂單統計）"""
         status = {
             "is_running": self.is_running,
             "active_orders_count": len(self.active_orders),
             "active_orders": self.active_orders,
             "grid_orders": self.grid_orders,
             "order_statistics": self.order_tracker.get_statistics(),
+            "order_tracking_stats": self.get_order_statistics(),  # ⭐ 新增：詳細訂單統計
             "event_queue_size": self.event_queue.get_queue_size() if self.event_queue else 0,
 
             # WebSocket 狀態
@@ -1185,20 +1740,34 @@ class GridTradingBot:
                 # 獲取當前市場價格
                 positions = await self.client.get_positions()
                 current_price = None
-                
+
                 # 嘗試從持倉信息中獲取當前價格
                 for position in positions.get('data', {}).get('rows', []):
                     if position.get('symbol') == self.profit_tracker.symbol:
                         current_price = Decimal(str(position.get('mark_price', 0)))
                         break
-                
+
                 # 獲取利潤統計摘要
                 profit_summary = self.profit_tracker.get_summary(current_price)
                 status["profit_statistics"] = profit_summary
-                
+
             except Exception as e:
                 logger.error(f"獲取利潤統計失敗: {e}")
                 status["profit_statistics"] = {"error": str(e)}
+
+        # ⭐ 新增：包含API速率統計
+        try:
+            status["api_rate_statistics"] = self.client.get_rate_statistics()
+        except Exception as e:
+            logger.error(f"獲取API速率統計失敗: {e}")
+            status["api_rate_statistics"] = {"error": str(e)}
+
+        # ⭐ 新增：包含並發處理統計
+        try:
+            status["concurrency_statistics"] = self.get_concurrency_statistics()
+        except Exception as e:
+            logger.error(f"獲取並發統計失敗: {e}")
+            status["concurrency_statistics"] = {"error": str(e)}
         
         if self.signal_generator:
             self.signal_generator.get_status()
@@ -1360,3 +1929,414 @@ class GridTradingBot:
                 "error": str(e)
             })
             # 不拋出異常，避免影響正常的停止流程
+
+    def get_comprehensive_analysis(self) -> Dict[str, Any]:
+        """
+        ⭐ 新增：獲取綜合分析報告
+        包含訂單、API、並發等各方面的統計和分析
+
+        Returns:
+            綜合分析報告
+        """
+        current_time = time.time()
+        analysis = {
+            "report_timestamp": current_time,
+            "session_id": self.session_id,
+            "is_running": self.is_running,
+            "uptime_seconds": (current_time - time.time()) if hasattr(self, 'start_time') else 0
+        }
+
+        try:
+            # 1. 訂單統計分析
+            order_stats = self.get_order_statistics()
+            analysis["order_analysis"] = {
+                **order_stats,
+                "health_score": self._calculate_order_health_score(order_stats),
+                "recommendations": self._get_order_recommendations(order_stats)
+            }
+
+            # 2. API速率統計分析
+            api_stats = self.client.get_rate_statistics()
+            analysis["api_analysis"] = {
+                **api_stats,
+                "health_score": self._calculate_api_health_score(api_stats),
+                "recommendations": self._get_api_recommendations(api_stats)
+            }
+
+            # 3. 並發處理分析
+            concurrency_stats = self.get_concurrency_statistics()
+            analysis["concurrency_analysis"] = {
+                **concurrency_stats,
+                "health_score": self._calculate_concurrency_health_score(concurrency_stats),
+                "recommendations": self._get_concurrency_recommendations(concurrency_stats)
+            }
+
+            # 4. 綜合健康評分
+            analysis["overall_health_score"] = self._calculate_overall_health_score(analysis)
+            analysis["overall_recommendations"] = self._get_overall_recommendations(analysis)
+
+            # 5. 趨勢分析
+            analysis["trends"] = self._analyze_trends()
+
+            # 6. 異常檢測
+            analysis["anomalies"] = self._detect_anomalies(analysis)
+
+        except Exception as e:
+            logger.error(f"生成綜合分析報告失敗: {e}")
+            analysis["error"] = str(e)
+
+        return analysis
+
+    def _calculate_order_health_score(self, order_stats: Dict) -> float:
+        """計算訂單處理健康評分 (0-100)"""
+        try:
+            scores = []
+
+            # 成功率評分 (40%)
+            if order_stats.get("orders_attempted", 0) > 0:
+                success_rate = order_stats.get("success_rate", 0)
+                scores.append(min(success_rate, 100) * 0.4)
+            else:
+                scores.append(50 * 0.4)  # 中性評分
+
+            # 信號處理率評分 (20%)
+            signal_rate = order_stats.get("signal_processing_rate", 0)
+            scores.append(min(signal_rate, 100) * 0.2)
+
+            # 重複率評分 (20%) - 重複率越低越好
+            if order_stats.get("orders_attempted", 0) > 0:
+                duplicate_rate = (order_stats.get("duplicate_prevented", 0) /
+                                order_stats["orders_attempted"]) * 100
+                # 重複率 < 10% 得滿分， > 50% 得0分
+                duplicate_score = max(0, (50 - duplicate_rate) * 2)
+                scores.append(min(duplicate_score, 100) * 0.2)
+            else:
+                scores.append(80 * 0.2)
+
+            # 錯誤類型分布評分 (20%) - 錯誤類型分散度
+            failure_reasons = order_stats.get("failure_reasons", {})
+            if failure_reasons:
+                # 錯誤類型越少越好（表示問題集中）
+                error_variety_score = max(0, 100 - len(failure_reasons) * 10)
+                scores.append(error_variety_score * 0.2)
+            else:
+                scores.append(100 * 0.2)  # 沒有錯誤
+
+            return sum(scores)
+
+        except Exception:
+            return 50  # 默認中性評分
+
+    def _calculate_api_health_score(self, api_stats: Dict) -> float:
+        """計算API健康評分 (0-100)"""
+        try:
+            scores = []
+
+            # 成功率評分 (40%)
+            success_rate = api_stats.get("success_rate", 0)
+            scores.append(min(success_rate, 100) * 0.4)
+
+            # 速率限制觸發率評分 (30%) - 觸發率越低越好
+            rate_limit_rate = api_stats.get("rate_limit_hit_rate", 0)
+            rate_limit_score = max(0, 100 - rate_limit_rate * 10)
+            scores.append(rate_limit_score * 0.3)
+
+            # 響應時間評分 (20%) - 響應時間越快越好
+            avg_response_time = api_stats.get("avg_response_time", 0)
+            if avg_response_time == 0:
+                response_score = 50
+            elif avg_response_time < 0.5:
+                response_score = 100
+            elif avg_response_time < 1.0:
+                response_score = 80
+            elif avg_response_time < 2.0:
+                response_score = 60
+            else:
+                response_score = max(0, 40 - avg_response_time * 10)
+            scores.append(response_score * 0.2)
+
+            # 慢請求比例評分 (10%) - 慢請求越少越好
+            if api_stats.get("total_requests", 0) > 0:
+                slow_rate = (api_stats.get("slow_requests", 0) /
+                           api_stats["total_requests"]) * 100
+                slow_score = max(0, 100 - slow_rate * 5)
+                scores.append(slow_score * 0.1)
+            else:
+                scores.append(80 * 0.1)
+
+            return sum(scores)
+
+        except Exception:
+            return 50
+
+    def _calculate_concurrency_health_score(self, concurrency_stats: Dict) -> float:
+        """計算並發處理健康評分 (0-100)"""
+        try:
+            scores = []
+
+            # 鎖競爭評分 (40%) - 競爭越少越好
+            lock_contentions = concurrency_stats.get("lock_contentions", 0)
+            contention_score = max(0, 100 - lock_contentions * 20)
+            scores.append(contention_score * 0.4)
+
+            # 並發信號處理評分 (30%) - 併發度適中為好
+            max_concurrent_signals = concurrency_stats.get("max_concurrent_signals", 0)
+            if max_concurrent_signals == 0:
+                concurrent_score = 50
+            elif max_concurrent_signals == 1:
+                concurrent_score = 100  # 理想情況
+            elif max_concurrent_signals <= 3:
+                concurrent_score = 80
+            else:
+                concurrent_score = max(0, 80 - (max_concurrent_signals - 3) * 10)
+            scores.append(concurrent_score * 0.3)
+
+            # 當前併發負載評分 (20%) - 當前併發數
+            current_concurrent = (concurrency_stats.get("current_concurrent_signals", 0) +
+                                concurrency_stats.get("current_concurrent_orders", 0))
+            if current_concurrent == 0:
+                load_score = 100
+            elif current_concurrent <= 2:
+                load_score = 80
+            else:
+                load_score = max(0, 80 - current_concurrent * 10)
+            scores.append(load_score * 0.2)
+
+            # 處理碰撞評分 (10%) - 碰撞越少越好
+            collisions = concurrency_stats.get("processing_collisions", 0)
+            collision_score = max(0, 100 - collisions * 25)
+            scores.append(collision_score * 0.1)
+
+            return sum(scores)
+
+        except Exception:
+            return 50
+
+    def _calculate_overall_health_score(self, analysis: Dict) -> float:
+        """計算整體健康評分"""
+        try:
+            order_score = analysis.get("order_analysis", {}).get("health_score", 50)
+            api_score = analysis.get("api_analysis", {}).get("health_score", 50)
+            concurrency_score = analysis.get("concurrency_analysis", {}).get("health_score", 50)
+
+            # 權重分配：訂單 50%, API 30%, 並發 20%
+            overall_score = (order_score * 0.5 + api_score * 0.3 + concurrency_score * 0.2)
+            return round(overall_score, 1)
+
+        except Exception:
+            return 50
+
+    def _get_order_recommendations(self, order_stats: Dict) -> list:
+        """獲取訂單處理建議"""
+        recommendations = []
+
+        try:
+            success_rate = order_stats.get("success_rate", 0)
+            if success_rate < 80:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "success_rate",
+                    "message": f"訂單成功率偏低 ({success_rate:.1f}%)，建議檢查網格配置和市場條件"
+                })
+
+            duplicate_rate = (order_stats.get("duplicate_prevented", 0) /
+                            max(order_stats.get("orders_attempted", 1), 1)) * 100
+            if duplicate_rate > 20:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "duplicate_orders",
+                    "message": f"重複訂單比例較高 ({duplicate_rate:.1f}%)，可能存在並發問題或信號頻繁變化"
+                })
+
+            validation_failures = order_stats.get("validation_failed", 0)
+            if validation_failures > 0:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "validation",
+                    "message": f"有 {validation_failures} 個訂單驗證失敗，建議檢查市場規則和參數設定"
+                })
+
+        except Exception as e:
+            recommendations.append({
+                "priority": "low",
+                "type": "analysis_error",
+                "message": f"訂單分析時發生錯誤: {e}"
+            })
+
+        return recommendations
+
+    def _get_api_recommendations(self, api_stats: Dict) -> list:
+        """獲取API使用建議"""
+        recommendations = []
+
+        try:
+            rate_limit_rate = api_stats.get("rate_limit_hit_rate", 0)
+            if rate_limit_rate > 5:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "rate_limit",
+                    "message": f"API速率限制觸發率較高 ({rate_limit_rate:.1f}%)，建議降低請求頻率"
+                })
+
+            avg_response_time = api_stats.get("avg_response_time", 0)
+            if avg_response_time > 2.0:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "response_time",
+                    "message": f"API平均響應時間較慢 ({avg_response_time:.3f}s)，可能影響系統性能"
+                })
+
+            success_rate = api_stats.get("success_rate", 0)
+            if success_rate < 90:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "api_reliability",
+                    "message": f"API成功率偏低 ({success_rate:.1f}%)，建議檢查網絡連接和API憑證"
+                })
+
+        except Exception as e:
+            recommendations.append({
+                "priority": "low",
+                "type": "analysis_error",
+                "message": f"API分析時發生錯誤: {e}"
+            })
+
+        return recommendations
+
+    def _get_concurrency_recommendations(self, concurrency_stats: Dict) -> list:
+        """獲取並發處理建議"""
+        recommendations = []
+
+        try:
+            lock_contentions = concurrency_stats.get("lock_contentions", 0)
+            if lock_contentions > 5:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "lock_contention",
+                    "message": f"檢測到 {lock_contentions} 次鎖競爭，可能影響性能，建議優化並發邏輯"
+                })
+
+            max_concurrent = concurrency_stats.get("max_concurrent_signals", 0)
+            if max_concurrent > 5:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "high_concurrency",
+                    "message": f"最大併發信號數較高 ({max_concurrent})，可能導致資源競爭"
+                })
+
+            collisions = concurrency_stats.get("processing_collisions", 0)
+            if collisions > 10:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "processing_collision",
+                    "message": f"檢測到 {collisions} 次處理碰撞，建議加強信號去重機制"
+                })
+
+        except Exception as e:
+            recommendations.append({
+                "priority": "low",
+                "type": "analysis_error",
+                "message": f"並發分析時發生錯誤: {e}"
+            })
+
+        return recommendations
+
+    def _get_overall_recommendations(self, analysis: Dict) -> list:
+        """獲取整體建議"""
+        recommendations = []
+        overall_score = analysis.get("overall_health_score", 50)
+
+        try:
+            if overall_score < 60:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "overall_health",
+                    "message": f"系統整體健康評分偏低 ({overall_score})，建議立即檢查和優化"
+                })
+            elif overall_score < 80:
+                recommendations.append({
+                    "priority": "medium",
+                    "type": "overall_health",
+                    "message": f"系統健康評分良好但有改善空間 ({overall_score})"
+                })
+
+            # 收集高優先級建議
+            all_recommendations = []
+            all_recommendations.extend(analysis.get("order_analysis", {}).get("recommendations", []))
+            all_recommendations.extend(analysis.get("api_analysis", {}).get("recommendations", []))
+            all_recommendations.extend(analysis.get("concurrency_analysis", {}).get("recommendations", []))
+
+            high_priority = [r for r in all_recommendations if r.get("priority") == "high"]
+            if high_priority:
+                recommendations.append({
+                    "priority": "high",
+                    "type": "summary",
+                    "message": f"發現 {len(high_priority)} 個高優先級問題需要立即處理"
+                })
+
+        except Exception as e:
+            recommendations.append({
+                "priority": "low",
+                "type": "analysis_error",
+                "message": f"整體分析時發生錯誤: {e}"
+            })
+
+        return recommendations
+
+    def _analyze_trends(self) -> Dict[str, Any]:
+        """分析趨勢"""
+        # 這裡可以實現基於歷史數據的趨勢分析
+        # 目前返回基礎信息
+        return {
+            "note": "趨勢分析功能需要歷史數據支持，當前版本提供基礎統計",
+            "potential_improvements": [
+                "基於時間序列的成功率趨勢",
+                "API響應時間變化趨勢",
+                "併發負載變化趨勢"
+            ]
+        }
+
+    def _detect_anomalies(self, analysis: Dict) -> list:
+        """檢測異常情況"""
+        anomalies = []
+
+        try:
+            order_stats = analysis.get("order_analysis", {})
+            api_stats = analysis.get("api_analysis", {})
+            concurrency_stats = analysis.get("concurrency_analysis", {})
+
+            # 檢測訂單異常
+            if order_stats.get("success_rate", 100) < 50:
+                anomalies.append({
+                    "type": "order_success_anomaly",
+                    "severity": "critical",
+                    "description": "訂單成功率異常偏低",
+                    "value": order_stats.get("success_rate", 0)
+                })
+
+            # 檢測API異常
+            if api_stats.get("rate_limit_hit_rate", 0) > 20:
+                anomalies.append({
+                    "type": "rate_limit_anomaly",
+                    "severity": "high",
+                    "description": "API速率限制觸發頻率異常",
+                    "value": api_stats.get("rate_limit_hit_rate", 0)
+                })
+
+            # 檢測並發異常
+            if concurrency_stats.get("processing_collisions", 0) > 20:
+                anomalies.append({
+                    "type": "concurrency_anomaly",
+                    "severity": "medium",
+                    "description": "並發處理碰撞異常頻繁",
+                    "value": concurrency_stats.get("processing_collisions", 0)
+                })
+
+        except Exception as e:
+            anomalies.append({
+                "type": "analysis_error",
+                "severity": "low",
+                "description": f"異常檢測時發生錯誤: {e}"
+            })
+
+        return anomalies
