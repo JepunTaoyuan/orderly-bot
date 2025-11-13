@@ -12,6 +12,7 @@ FastAPI 伺服器 (MVP)
 
 import asyncio
 import time
+import hashlib
 from typing import Any, Optional
 from datetime import datetime
 
@@ -19,10 +20,11 @@ from dotenv import load_dotenv
 import os
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic import model_validator
 from contextlib import asynccontextmanager
+import json
 
 from src.core.grid_signal import Direction
 from src.services.session_service import SessionManager
@@ -97,6 +99,10 @@ async def lifespan(app: FastAPI):
         slowapi_limiter = get_slowapi_rate_limiter()
         logger.info("SlowAPI 速率限制器初始化完成")
 
+        # 🚀 優化：初始化 SessionManager 使用統一數據庫連接池
+        await session_manager.initialize()
+        logger.info("SessionManager 已使用統一數據庫連接池初始化")
+
         # 記錄速率限制配置
         logger.info("速率限制配置", data={
             "global_limit": RATE_LIMITS['global'],
@@ -145,6 +151,30 @@ async def lifespan(app: FastAPI):
         logger.info("WebSocket 管理器已停止")
     except Exception as e:
         logger.error(f"停止 WebSocket 管理器失敗: {e}")
+
+    # 🚀 優化：停止會話緩存系統
+    try:
+        if hasattr(session_manager, 'session_cache') and session_manager.session_cache:
+            await session_manager.session_cache.stop()
+            logger.info("會話緩存系統已停止")
+    except Exception as e:
+        logger.error(f"停止會話緩存系統失敗: {e}")
+
+    # 🚀 優化：停止 GridTradingBot 對象池
+    try:
+        if hasattr(session_manager, 'bot_pool') and session_manager.bot_pool:
+            await session_manager.bot_pool.stop()
+            logger.info("GridTradingBot 對象池已停止")
+    except Exception as e:
+        logger.error(f"停止對象池失敗: {e}")
+
+    # 🚀 優化：停止 API 批量調用優化器
+    try:
+        if hasattr(session_manager, 'api_optimizer') and session_manager.api_optimizer:
+            await session_manager.api_optimizer.stop()
+            logger.info("API 批量調用優化器已停止")
+    except Exception as e:
+        logger.error(f"停止 API 優化器失敗: {e}")
 
     # 關閉數據庫連接
     try:
@@ -410,6 +440,52 @@ class StartConfig(BaseModel):
         }
 
 
+async def _pre_validate_grid_session(user_id: str, ticker: str) -> None:
+    """
+    預驗證網格會話的唯一性，在進行複雜操作前快速檢查
+
+    Args:
+        user_id: 用戶ID
+        ticker: 交易對
+
+    Raises:
+        GridTradingException: 如果發現重複會話
+    """
+    try:
+        # 快速內存檢查
+        user_sessions = await session_manager.get_user_sessions(user_id)
+        for session_data in user_sessions.values():
+            if (session_data.get('ticker') == ticker and
+                session_data.get('is_running', False)):
+                raise GridTradingException(
+                    error_code=ErrorCode.DUPLICATE_GRID_SESSION,
+                    details={
+                        "user_id": user_id,
+                        "ticker": ticker,
+                        "existing_session_id": session_data.get('session_id'),
+                        "message": f"用戶 {user_id} 在交易對 {ticker} 上已有活躍的網格會話"
+                    }
+                )
+
+        # 數據庫層面檢查
+        duplicate_session = await db_manager.check_duplicate_grid_session(user_id, ticker)
+        if duplicate_session:
+            raise GridTradingException(
+                error_code=ErrorCode.DUPLICATE_GRID_SESSION,
+                details={
+                    "user_id": user_id,
+                    "ticker": ticker,
+                    "existing_session_id": duplicate_session.get('session_id'),
+                    "message": f"數據庫中發現用戶 {user_id} 在交易對 {ticker} 上有其他活躍會話"
+                }
+            )
+
+    except GridTradingException:
+        raise
+    except Exception as e:
+        # 預驗證失敗不應該阻止請求，記錄警告但繼續處理
+        logger.warning(f"預驗證網格會話失敗，將繼續處理請求: {e}")
+
 @app.post("/api/grid/start")
 @limiter.limit(RATE_LIMITS['grid_control'])
 @api_retry
@@ -429,7 +505,10 @@ async def start_grid(request: Request, config: StartConfig):
 
     session_id = create_session_id(config.user_id, config.ticker)
     print(session_id)
-    
+
+    # 預驗證：快速檢查重複會話
+    await _pre_validate_grid_session(config.user_id, config.ticker)
+
     with SessionContextManager(session_id):
         try:
             logger.info("啟動網格交易請求", event_type="grid_start", data={
@@ -451,7 +530,7 @@ async def start_grid(request: Request, config: StartConfig):
                     error_code=ErrorCode.SESSION_ALREADY_EXISTS,
                     details={"session_id": session_id}
                 )
-                
+
         except GridTradingException:
             # 重新拋出自定義異常，讓全域處理器處理
             raise
@@ -612,7 +691,7 @@ async def get_user_grid_strategies(request: Request, user_id: str):
             "success": True,
             "data": {
                 "user_id": user_id,
-                "strategies": list[str, Any](user_sessions.values()),
+                "strategies": list(user_sessions.values()),
                 "total_strategies": len(user_sessions)
             }
         }
@@ -1163,6 +1242,119 @@ async def get_user_grid_statistics(request: Request, user_id: str):
             details={"user_id": user_id},
             original_error=e
         )
+
+@app.get("/api/grid/stream/{user_id}")
+async def stream_user_strategies(request: Request, user_id: str):
+    """
+    🚀 優化版本：智能 SSE 流，支持緩存、變化檢測和動態頻率調整
+    """
+    async def event_generator():
+        try:
+            # SSE 連接狀態
+            last_payload_hash = None
+            no_change_count = 0
+            base_interval = 1.0
+            current_interval = base_interval
+
+            # 🚀 優化：使用更智能的頻率調整策略
+            def calculate_interval(strategy_count: int, no_change_streak: int) -> float:
+                """
+                根據策略數量和無變化持續時間智能調整更新頻率
+
+                Args:
+                    strategy_count: 當前策略數量
+                    no_change_streak: 連續無變化次數
+
+                Returns:
+                    調整後的間隔時間（秒）
+                """
+                # 基礎間隔根據策略數量調整
+                if strategy_count > 50:
+                    base = 2.0  # 大量策略時降低頻率
+                elif strategy_count > 20:
+                    base = 1.5  # 中等數量策略
+                else:
+                    base = 1.0  # 少量策略時保持高頻率
+
+                # 如果長時間無變化，逐步增加間隔（最高到10秒）
+                if no_change_streak > 30:  # 30次無變化（約30秒）
+                    return min(base * 4, 10.0)
+                elif no_change_streak > 10:  # 10次無變化（約10秒）
+                    return min(base * 2, 5.0)
+                else:
+                    return base
+
+            # 發送初始連接確認
+            yield "event: connected\n" + f"data: {json.dumps({'message': 'connected', 'user_id': user_id})}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    # 🚀 優化：使用緩存但允許手動刷新
+                    sessions = await session_manager.get_user_sessions(user_id, use_cache=no_change_count < 5)
+
+                    # 構建載荷
+                    payload = {
+                        "user_id": user_id,
+                        "strategies": list(sessions.values()),
+                        "total_strategies": len(sessions),
+                        "timestamp": time.time(),
+                        "update_interval": current_interval,
+                        "cache_used": no_change_count < 5
+                    }
+
+                    # 🚀 優化：計算載荷哈希檢測變化
+                    payload_str = json.dumps(payload, sort_keys=True)
+                    current_hash = hashlib.md5(payload_str.encode()).hexdigest()
+
+                    # 只有在數據變化時才發送完整載荷
+                    if current_hash != last_payload_hash:
+                        data = json.dumps(payload)
+                        yield f"data: {data}\n\n"
+                        last_payload_hash = current_hash
+                        no_change_count = 0
+                    else:
+                        # 無變化時只發送心跳
+                        no_change_count += 1
+                        if no_change_count % 10 == 0:  # 每10次無變化發送一次心跳
+                            heartbeat = {
+                                "user_id": user_id,
+                                "heartbeat": True,
+                                "no_change_count": no_change_count,
+                                "timestamp": time.time()
+                            }
+                            yield f"data: {json.dumps(heartbeat)}\n\n"
+
+                    # 🚀 優化：智能調整更新頻率
+                    current_interval = calculate_interval(len(sessions), no_change_count)
+
+                    # 動態休眠
+                    await asyncio.sleep(current_interval)
+
+                except Exception as e:
+                    logger.error(f"SSE 流處理錯誤: {e}")
+                    yield "event: error\n" + f"data: {json.dumps({'message': f'stream_error: {str(e)}'})}\n\n"
+                    await asyncio.sleep(5.0)  # 錯誤時等待更長時間
+
+        except Exception as e:
+            logger.error(f"SSE 生成器錯誤: {e}")
+            yield "event: error\n" + f"data: {json.dumps({'message': 'generator_error', 'error': str(e)})}\n\n"
+
+    # 🚀 優化：添加響應頭優化客戶端體驗
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Credentials': 'true'
+    }
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=headers
+    )
 
 
 @app.get("/")

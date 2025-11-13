@@ -8,12 +8,17 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 from src.core.grid_bot import GridTradingBot
 from src.services.database_service import MongoManager
+from src.services.database_connection import db_manager
 from src.utils.logging_config import get_logger, metrics
 from src.utils.error_codes import GridTradingException, ErrorCode
+from src.utils.session_cache import get_session_cache, SessionStateCache
+from src.utils.bot_pool import get_bot_pool, GridTradingBotPool
+from src.utils.api_batch_optimizer import get_api_optimizer, APIBatchOptimizer
 import os
 
 logger = get_logger("session_manager")
@@ -60,9 +65,15 @@ class SessionManager:
         """初始化會話管理器"""
         self.sessions: Dict[str, GridTradingBot] = {}
         self._creating_sessions: set = set()  # 追踪正在創建的會話
-        self._sessions_lock = asyncio.Lock()
+
+        # 🚀 優化：使用更細粒度的鎖機制
+        self._sessions_lock = asyncio.Lock()  # 主要會話操作鎖
+        self._creation_lock = asyncio.Lock()  # 創建操作專用鎖
+        self._user_session_locks = defaultdict(asyncio.Lock)  # 用戶級別的鎖，避免用戶間互相阻塞
+
         self._creation_limiter = SessionCreationLimiter()
-        self.mongo_manager = MongoManager(os.getenv("MONGODB_URI"))
+        # 🚀 優化：將在初始化後設置，以避免創建重複連接池
+        self.mongo_manager = None
 
         # 性能統計
         self.creation_metrics = {
@@ -71,7 +82,132 @@ class SessionManager:
             'failed': 0,
             'rate_limited': 0
         }
+
+    async def initialize(self):
+        """初始化 SessionManager，設置 MongoManager、緩存和對象池"""
+        if self.mongo_manager is None:
+            # 🚀 優化：使用統一的數據庫管理器獲取 MongoManager
+            self.mongo_manager = await db_manager.get_mongo_manager()
+            logger.info("SessionManager 已使用統一數據庫連接池初始化")
+
+        # 🚀 優化：初始化會話狀態緩存
+        self.session_cache = await get_session_cache()
+        await self.session_cache.start()
+        logger.info("SessionManager 緩存系統已啟動")
+
+        # 🚀 優化：初始化 GridTradingBot 對象池
+        self.bot_pool = await get_bot_pool()
+        await self.bot_pool.start()
+        logger.info("SessionManager 對象池已啟動")
+
+        # 🚀 優化：初始化 API 批量調用優化器
+        self.api_optimizer = await get_api_optimizer()
+        await self.api_optimizer.start()
+        logger.info("SessionManager API 優化器已啟動")
     
+    async def _validate_session_uniqueness(self, session_id: str, config: Dict[str, Any]) -> None:
+        """
+        驗證會話唯一性：確保同一個 ticker-account 組合只能有一個活躍會話
+
+        Args:
+            session_id: 會話ID
+            config: 網格配置
+
+        Raises:
+            GridTradingException: 如果發現重複的網格會話
+        """
+        # 從配置中獲取 user_id 和 ticker（最可靠的來源）
+        user_id = config.get('user_id')
+        ticker = config.get('ticker')
+
+        if not user_id:
+            logger.warning(f"配置中缺少 user_id")
+            return
+
+        if not ticker:
+            logger.warning(f"配置中缺少 ticker")
+            return
+
+        # 也嘗試從 session_id 解析作為備份
+        user_id_from_id = None
+        ticker_from_id = None
+        if '_' in session_id:
+            parts = session_id.split('_', 1)
+            if len(parts) == 2:
+                user_id_from_id = parts[0]
+                ticker_from_id = parts[1]
+
+        # 驗證一致性（可選，用於調試）
+        if user_id_from_id and user_id_from_id != user_id:
+            logger.warning(f"Session ID 和配置中的 user_id 不一致: {user_id_from_id} vs {user_id}")
+
+        if ticker_from_id and ticker_from_id != ticker:
+            logger.warning(f"Session ID 和配置中的 ticker 不一致: {ticker_from_id} vs {ticker}")
+
+        # 檢查是否有相同的 ticker-account 組合
+        async with self._sessions_lock:
+            for existing_session_id, bot in self.sessions.items():
+                if not bot.is_running:
+                    continue
+
+                # 對於現有會話，我們需要獲取它們的配置信息
+                # 由於我們在創建時保存了配置，可以通過其他方式獲取
+                # 但為了簡化，我們使用基於模式匹配的方法
+
+                # 使用更智能的解析：尋找 PERP_ 模式來分離 user_id 和 ticker
+                if '_PERP_' in existing_session_id:
+                    # 格式：user_id_PERP_[SYMBOL]_USDC
+                    perp_index = existing_session_id.find('_PERP_')
+                    existing_user_id = existing_session_id[:perp_index]
+                    existing_ticker = existing_session_id[perp_index + 1:]  # 從 PERP_ 開始
+                else:
+                    # 後備方案：簡單分割
+                    if '_' in existing_session_id:
+                        existing_user_id = existing_session_id.split('_', 1)[0]
+                        existing_ticker = existing_session_id.split('_', 1)[1]
+                    else:
+                        existing_user_id = existing_session_id
+                        existing_ticker = 'unknown'
+
+                # 檢查是否為相同組合
+                if existing_user_id == user_id and existing_ticker == ticker:
+                    logger.warning(f"發現重複的網格會話: 現有會話 {existing_session_id}，新會話 {session_id}")
+                    raise GridTradingException(
+                        error_code=ErrorCode.DUPLICATE_GRID_SESSION,
+                        details={
+                            "existing_session_id": existing_session_id,
+                            "new_session_id": session_id,
+                            "user_id": user_id,
+                            "ticker": ticker,
+                            "message": f"用戶 {user_id} 在交易對 {ticker} 上已有活躍的網格會話 {existing_session_id}"
+                        }
+                    )
+
+        # 同時檢查數據庫中是否有重複記錄
+        try:
+            # 查詢數據庫中相同的 ticker-account 組合
+            existing_sessions = await self.mongo_manager.get_user_sessions(user_id)
+            for existing_session in existing_sessions:
+                if (existing_session.get('ticker') == ticker and
+                    existing_session.get('status') == 'active' and
+                    existing_session.get('session_id') != session_id):
+                    logger.warning(f"數據庫中發現重複的網格會話: {existing_session.get('session_id')}")
+                    raise GridTradingException(
+                        error_code=ErrorCode.DUPLICATE_GRID_SESSION,
+                        details={
+                            "existing_session_id": existing_session.get('session_id'),
+                            "new_session_id": session_id,
+                            "user_id": user_id,
+                            "ticker": ticker,
+                            "message": f"數據庫中發現用戶 {user_id} 在交易對 {ticker} 上有其他活躍會話"
+                        }
+                    )
+        except Exception as e:
+            # 如果數據庫查詢失敗，記錄警告但不阻止會話創建
+            if isinstance(e, GridTradingException):
+                raise
+            logger.error(f"查詢數據庫檢查會話唯一性失敗: {e}")
+
     async def create_session(self, session_id: str, config: Dict[str, Any]) -> bool:
         """
         創建新的交易會話（優化版本，支持高並發）
@@ -98,6 +234,9 @@ class SessionManager:
             )
 
         try:
+            # 驗證會話唯一性
+            await self._validate_session_uniqueness(session_id, config)
+
             # 使用細粒度鎖：先檢查是否已存在
             async with self._sessions_lock:
                 if session_id in self.sessions:
@@ -124,13 +263,12 @@ class SessionManager:
                 if not user_data:
                     raise ValueError(f"用戶 {user_id} 不存在")
 
-                # 創建 GridTradingBot 實例，傳入用戶憑證
+                # 🚀 優化：從對象池獲取 GridTradingBot 實例
                 wallet_address = user_data.get('wallet_address') or user_data.get('evm_wallet_address')
-                bot = GridTradingBot(
+                bot = await self.bot_pool.get_bot(
                     account_id=user_id,
                     orderly_key=user_data.get('api_key'),
-                    orderly_secret=user_data.get('api_secret'),
-                    orderly_testnet=True  # 可以從配置或環境變數獲取
+                    orderly_secret=user_data.get('api_secret')
                 )
 
                 # 將用戶憑證添加到配置中，供 GridTradingBot 使用
@@ -242,49 +380,86 @@ class SessionManager:
         Returns:
             是否停止成功
         """
+        # 鎖內僅做讀取與存在性檢查，避免長時間持鎖
         async with self._sessions_lock:
             if session_id not in self.sessions:
                 logger.warning(f"會話 {session_id} 不存在")
-                # 即使會話不存在，也要清理 _creating_sessions
                 self._creating_sessions.discard(session_id)
                 return False
-
             bot = self.sessions[session_id]
-            stop_successful = False
-            cleanup_errors = []
 
+        stop_successful = False
+        cleanup_errors = []
+        stop_error = None
+
+        try:
+            await bot.stop_grid_trading()
+            stop_successful = True
+            logger.info(f"會話 {session_id} 正常停止")
+        except Exception as e:
+            stop_error = e
+            cleanup_errors.append(f"停止錯誤: {str(e)}")
+            logger.warning(f"停止會話 {session_id} 時發生錯誤: {e}")
+
+        # 釋放鎖後再獲鎖進行最終清理與狀態更新
+        async with self._sessions_lock:
             try:
-                # 嘗試正常停止網格交易
-                await bot.stop_grid_trading()
-                stop_successful = True
-                logger.info(f"會話 {session_id} 正常停止")
-            except Exception as e:
-                # 記錄停止錯誤但不重新拋出，因為會話需要被清理
-                cleanup_errors.append(f"停止錯誤: {str(e)}")
-                logger.warning(f"停止會話 {session_id} 時發生錯誤: {e}")
-                # 即使停止失敗，也要繼續清理流程
-            finally:
-                # 無論停止是否成功，都要清理會話數據
-                try:
+                if session_id in self.sessions:
                     del self.sessions[session_id]
-                    self._creating_sessions.discard(session_id)
+                self._creating_sessions.discard(session_id)
 
-                    if cleanup_errors:
-                        logger.warning(f"會話 {session_id} 已清理，但有 {len(cleanup_errors)} 個警告: {'; '.join(cleanup_errors)}")
-                    else:
-                        logger.info(f"會話 {session_id} 已成功停止並清理")
+                if cleanup_errors:
+                    logger.warning(f"會話 {session_id} 已清理，但有 {len(cleanup_errors)} 個警告: {'; '.join(cleanup_errors)}")
+                else:
+                    logger.info(f"會話 {session_id} 已成功停止並清理")
 
-                    # 如果核心停止功能成功，或即使有警告但會話已清理，都返回 True
-                    return True
+                # 🚀 優化：清理相關緩存
+                await self._clear_session_cache(session_id)
 
-                except Exception as cleanup_error:
-                    # 清理本身的錯誤
-                    logger.error(f"清理會話 {session_id} 數據時發生錯誤: {cleanup_error}")
-                    raise GridTradingException(
-                        error_code=ErrorCode.SESSION_STOP_FAILED,
-                        details={"session_id": session_id, "cleanup_error": str(cleanup_error)},
-                        original_error=cleanup_error
-                    )
+                # 🚀 優化：將 bot 歸還到對象池
+                if hasattr(self, 'bot_pool') and stop_successful:
+                    try:
+                        await self.bot_pool.return_bot(bot)
+                        logger.debug(f"已將 bot 歸還到對象池: {session_id}")
+                    except Exception as e:
+                        logger.warning(f"歸還 bot 到對象池失敗: {e}")
+
+                if stop_error is not None:
+                    raise stop_error
+                return True
+            except Exception as cleanup_error:
+                logger.error(f"清理會話 {session_id} 數據時發生錯誤: {cleanup_error}")
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_STOP_FAILED,
+                    details={"session_id": session_id, "cleanup_error": str(cleanup_error)},
+                    original_error=cleanup_error
+                )
+
+    async def _clear_session_cache(self, session_id: str):
+        """
+        清理會話相關的緩存條目
+
+        Args:
+            session_id: 會話ID
+        """
+        if not hasattr(self, 'session_cache'):
+            return
+
+        try:
+            # 解析用戶ID
+            user_id = session_id.split('_', 1)[0] if '_' in session_id else session_id
+
+            # 清理用戶會話緩存
+            cache_key = f"user_sessions_{user_id}"
+            await self.session_cache.invalidate(cache_key)
+
+            # 清理個別會話緩存（如果有）
+            await self.session_cache.invalidate(session_id)
+
+            logger.debug(f"已清理會話 {session_id} 的相關緩存")
+
+        except Exception as e:
+            logger.warning(f"清理會話 {session_id} 緩存時發生錯誤: {e}")
 
     async def force_cleanup_session(self, session_id: str) -> bool:
         """
@@ -359,58 +534,220 @@ class SessionManager:
         async with self._sessions_lock:
             return {sid: bot.is_running for sid, bot in self.sessions.items()}
 
-    async def get_user_sessions(self, user_id: str) -> Dict[str, Dict[str, Any]]:
+    async def get_user_sessions(self, user_id: str, use_cache: bool = True) -> Dict[str, Dict[str, Any]]:
         """
         獲取指定用戶的所有活躍網格策略會話
 
         Args:
             user_id: 用戶ID
+            use_cache: 是否使用緩存（默認True）
 
         Returns:
             該用戶的所有會話詳細信息字典
         """
-        async with self._sessions_lock:
+        # 🚀 優化：嘗試從緩存獲取
+        cache_key = f"user_sessions_{user_id}"
+        if use_cache and hasattr(self, 'session_cache'):
+            cached_data = await self.session_cache.get(cache_key)
+            if cached_data:
+                logger.debug(f"從緩存獲取用戶 {user_id} 的會話數據")
+                return cached_data
+
+        # 🚀 優化：使用用戶級別的鎖，避免用戶間互相阻塞
+        user_lock = self._user_session_locks[user_id]
+        async with user_lock:
+            # 🚀 優化：讀取操作使用最小鎖定時間
+            async with self._sessions_lock:
+                # 快速複製相關會話信息，然後釋放鎖
+                user_session_items = []
+                for session_id, bot in self.sessions.items():
+                    # 解析session_id中的user_id (格式: user_id_ticker)
+                    session_user_id = session_id.split('_', 1)[0] if '_' in session_id else session_id
+
+                    if session_user_id == user_id and bot.is_running:
+                        user_session_items.append((session_id, bot))
+
+            # 🚀 優化：在鎖外執行並行狀態獲取
             user_sessions = {}
 
-            for session_id, bot in self.sessions.items():
-                # 解析session_id中的user_id (格式: user_id_ticker)
-                session_user_id = session_id.split('_', 1)[0] if '_' in session_id else session_id
+            if user_session_items:
+                # 並行獲取所有會話狀態
+                session_tasks = []
+                session_ids = []
 
-                if session_user_id == user_id and bot.is_running:
-                    try:
-                        # 獲取會話狀態
-                        status = await bot.get_status()
+                for session_id, bot in user_session_items:
+                    session_ids.append(session_id)
+                    session_tasks.append(self._get_session_status_safe(session_id, bot, user_id))
 
-                        # 從session_id提取ticker
-                        ticker = session_id.split('_', 1)[1] if '_' in session_id else 'unknown'
+                try:
+                    results = await asyncio.gather(*session_tasks, return_exceptions=True)
 
-                        user_sessions[session_id] = {
-                            'session_id': session_id,
-                            'user_id': user_id,
-                            'ticker': ticker,
-                            'is_running': bot.is_running,
-                            'status': status,
-                        }
-                    except Exception as e:
-                        logger.error(f"獲取會話 {session_id} 狀態失敗: {e}")
-                        # 即使獲取狀態失敗，也返回基本資訊
+                    for i, result in enumerate(results):
+                        session_id = session_ids[i]
+
+                        if isinstance(result, Exception):
+                            # 處理異常
+                            logger.error(f"獲取會話 {session_id} 狀態失敗: {result}")
+                            user_sessions[session_id] = {
+                                'session_id': session_id,
+                                'user_id': user_id,
+                                'ticker': session_id.split('_', 1)[1] if '_' in session_id else 'unknown',
+                                'is_running': False,
+                                'status': None,
+                                'error': str(result)
+                            }
+                        else:
+                            user_sessions[session_id] = result
+
+                except Exception as e:
+                    logger.error(f"批量獲取會話狀態時發生錯誤: {e}")
+                    # 如果批量獲取失敗，回退到串行處理
+                    for session_id, _ in user_session_items:
                         user_sessions[session_id] = {
                             'session_id': session_id,
                             'user_id': user_id,
                             'ticker': session_id.split('_', 1)[1] if '_' in session_id else 'unknown',
-                            'is_running': bot.is_running,
+                            'is_running': False,
                             'status': None,
-                            'error': str(e)
+                            'error': '批量獲取失敗'
                         }
 
+            # 🚀 優化：緩存結果（較短的TTL，因為會話狀態變化頻繁）
+            if use_cache and hasattr(self, 'session_cache') and user_sessions:
+                await self.session_cache.set(cache_key, user_sessions, ttl=5.0)  # 5秒緩存
+                logger.debug(f"已緩存用戶 {user_id} 的 {len(user_sessions)} 個會話")
+
             return user_sessions
+
+    async def _get_session_status_safe(self, session_id: str, bot, user_id: str) -> Dict[str, Any]:
+        """
+        安全獲取單個會話狀態，包含錯誤處理
+
+        Args:
+            session_id: 會話ID
+            bot: GridTradingBot實例
+            user_id: 用戶ID
+
+        Returns:
+            會話狀態字典
+        """
+        try:
+            # 獲取會話狀態
+            status = await bot.get_status()
+
+            # 從session_id提取ticker
+            ticker = session_id.split('_', 1)[1] if '_' in session_id else 'unknown'
+
+            return {
+                'session_id': session_id,
+                'user_id': user_id,
+                'ticker': ticker,
+                'is_running': bot.is_running,
+                'status': status,
+                'last_updated': time.time()
+            }
+        except Exception as e:
+            logger.error(f"獲取會話 {session_id} 狀態失敗: {e}")
+            # 即使獲取狀態失敗，也返回基本資訊
+            return {
+                'session_id': session_id,
+                'user_id': user_id,
+                'ticker': session_id.split('_', 1)[1] if '_' in session_id else 'unknown',
+                'is_running': bot.is_running,
+                'status': None,
+                'error': str(e),
+                'last_updated': time.time()
+            }
     
     async def stop_all_sessions(self):
-        """停止所有會話"""
+        """🚀 優化：並行停止所有會話"""
         async with self._sessions_lock:
             session_ids = list(self.sessions.keys())
-            
+
+        if not session_ids:
+            logger.info("沒有活動的會話需要停止")
+            return
+
+        logger.info(f"開始並行停止 {len(session_ids)} 個會話")
+
+        # 🚀 優化：使用信號量控制並發數，避免系統過載
+        semaphore = asyncio.Semaphore(5)  # 最多同時停止5個會話
+
+        async def limited_stop(session_id: str) -> tuple[str, bool]:
+            async with semaphore:
+                try:
+                    success = await self.stop_session(session_id)
+                    return session_id, success
+                except Exception as e:
+                    logger.error(f"停止會話 {session_id} 失敗: {e}")
+                    return session_id, False
+
+        # 🚀 優化：並行執行所有停止操作
+        stop_tasks = [limited_stop(session_id) for session_id in session_ids]
+        results = await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+        # 統計結果
+        successful = sum(1 for _, success in results if success)
+        failed = len(session_ids) - successful
+
+        logger.info(f"批量停止會話完成: {successful} 成功, {failed} 失敗")
+
+        # 🚀 優化：批量清理相關緩存
+        if hasattr(self, 'session_cache'):
+            user_ids = set()
+            for session_id in session_ids:
+                user_id = session_id.split('_', 1)[0] if '_' in session_id else session_id
+                user_ids.add(user_id)
+
+            cache_keys = [f"user_sessions_{user_id}" for user_id in user_ids]
+            await self.session_cache.invalidate_batch(cache_keys)
+            logger.debug(f"已清理 {len(cache_keys)} 個用戶的會話緩存")
+
+    async def stop_sessions_batch(self, session_ids: List[str]) -> Dict[str, bool]:
+        """
+        🚀 優化：批量停止指定的會話
+
+        Args:
+            session_ids: 要停止的會話ID列表
+
+        Returns:
+            {session_id: success_bool} 的字典
+        """
+        logger.info(f"開始批量停止 {len(session_ids)} 個指定會話")
+
+        # 過濾存在的會話
+        async with self._sessions_lock:
+            existing_sessions = [sid for sid in session_ids if sid in self.sessions]
+
+        if not existing_sessions:
+            logger.warning("沒有找到要停止的活動會話")
+            return {sid: False for sid in session_ids}
+
+        # 使用信號量控制並發數
+        semaphore = asyncio.Semaphore(5)
+
+        async def limited_stop(session_id: str) -> tuple[str, bool]:
+            async with semaphore:
+                try:
+                    success = await self.stop_session(session_id)
+                    return session_id, success
+                except Exception as e:
+                    logger.error(f"批量停止會話 {session_id} 失敗: {e}")
+                    return session_id, False
+
+        # 並行執行停止操作
+        stop_tasks = [limited_stop(session_id) for session_id in existing_sessions]
+        results = await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+        # 構建結果字典
+        result_dict = {}
         for session_id in session_ids:
-            await self.stop_session(session_id)
-        
-        logger.info("所有會話已停止")
+            result_dict[session_id] = False  # 默認失敗
+
+        for session_id, success in results:
+            result_dict[session_id] = success
+
+        successful = sum(result_dict.values())
+        logger.info(f"批量停止指定會話完成: {successful}/{len(session_ids)} 成功")
+
+        return result_dict

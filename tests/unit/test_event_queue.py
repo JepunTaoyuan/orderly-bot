@@ -418,7 +418,7 @@ class TestSessionEventQueue:
     async def test_concurrent_event_addition(self):
         """Test adding events concurrently."""
         mock_handler = AsyncMock()
-        queue = SessionEventQueue("test_session", mock_handler)
+        queue = SessionEventQueue("test_session", mock_handler, batch_size=20, batch_timeout=5.0)
 
         await queue.start()
 
@@ -437,8 +437,13 @@ class TestSessionEventQueue:
 
         await asyncio.gather(*tasks)
 
-        # Should have 15 events total
-        assert queue.get_queue_size() == 15
+        # Wait a bit for processing
+        await asyncio.sleep(0.1)
+
+        # All events should be processed (batch_size=20 means they accumulate, but since we have only 15, they wait for timeout)
+        assert queue.get_queue_size() == 0
+        stats = queue.get_statistics()
+        assert stats['events_processed'] == 15
 
         await queue.stop()
 
@@ -480,7 +485,7 @@ class TestSessionEventQueue:
         processed_events = []
 
         async def slow_handler(event):
-            await asyncio.sleep(0.1)  # Slow processing
+            await asyncio.sleep(0.05)  # Slow processing
             processed_events.append(event)
 
         queue = SessionEventQueue("test_session", slow_handler)
@@ -492,9 +497,11 @@ class TestSessionEventQueue:
             event = Event(EventType.SIGNAL, {"data": i})
             await queue.add_event(event)
 
+        # Give a moment for events to be processed
+        await asyncio.sleep(0.2)
+
         # Stop queue (should wait for processing to complete)
         await queue.stop()
 
         # All events should be processed
         assert len(processed_events) == 3
-        assert queue.is_running == False

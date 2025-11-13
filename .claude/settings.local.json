@@ -1,7 +1,7 @@
 {
   "env": {
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6"
+    "ANTHROPIC_AUTH_TOKEN": "088ae4f0eee64f1fa599a4f22a26d880.rElkJFBMumYTPM0o",
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"
   },
   "permissions": {
     "allow": [
@@ -14,7 +14,9 @@
       "Bash(python:*)",
       "Bash(git checkout:*)",
       "Bash(PYTHONPATH=/mnt/c/Users/user/Desktop/orderly_back/orderly_bot python:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "WebFetch(domain:orderly.network)",
+      "Bash(timeout 30 pytest:*)"
     ],
     "deny": [],
     "ask": []

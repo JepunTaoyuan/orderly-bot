@@ -33,6 +33,7 @@ class ErrorCode(Enum):
     UNKNOWN_WALLET_TYPE = "E3004"
     SESSION_CREATE_RATE_LIMITED = "E3005"
     INVALID_SESSION_ID = "E3006"
+    DUPLICATE_GRID_SESSION = "E3007"  # 同一ticker-account組合的會話已存在
     
     # 交易相關錯誤 (4000-4999)
     INVALID_SYMBOL = "E4000"
@@ -50,6 +51,12 @@ class ErrorCode(Enum):
     INVALID_TOTAL_AMOUNT = "E5003"
     PRICE_OUT_OF_BOUNDS = "E5004"
     
+    # 網格交易錯誤 (5500-5999)
+    GRID_TRADING_ERROR = "E5503"  # General grid trading error
+    GRID_START_FAILED = "E5500"
+    GRID_STOP_FAILED = "E5501"
+    GRID_EXECUTION_ERROR = "E5502"
+
     # 外部服務錯誤 (6000-6999)
     ORDERLY_API_ERROR = "E6000"
     ORDERLY_CONNECTION_ERROR = "E6001"
@@ -81,7 +88,8 @@ class ErrorDetail:
     message: str
     description: str
     http_status: int = 500
-    user_message: Optional[str] = None  # 用戶友好的錯誤訊息
+    user_message: Optional[str] = None  # 用戶友好的錯誤訊息 (Chinese)
+    user_message_en: Optional[str] = None  # User-friendly error message (English)
 
 
 # 錯誤碼對應的詳細信息
@@ -122,7 +130,37 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         http_status=500,
         user_message="伺服器內部錯誤，請稍後重試"
     ),
-    
+
+    # 認證錯誤
+    ErrorCode.UNAUTHORIZED: ErrorDetail(
+        code=ErrorCode.UNAUTHORIZED,
+        message="Unauthorized",
+        description="Authentication is required",
+        http_status=401,
+        user_message="未經授權"
+    ),
+    ErrorCode.INVALID_CREDENTIALS: ErrorDetail(
+        code=ErrorCode.INVALID_CREDENTIALS,
+        message="Invalid credentials",
+        description="The provided credentials are invalid",
+        http_status=401,
+        user_message="憑證無效"
+    ),
+    ErrorCode.TOKEN_EXPIRED: ErrorDetail(
+        code=ErrorCode.TOKEN_EXPIRED,
+        message="Token expired",
+        description="The authentication token has expired",
+        http_status=401,
+        user_message="認證令牌已過期"
+    ),
+    ErrorCode.INVALID_SIGNATURE: ErrorDetail(
+        code=ErrorCode.INVALID_SIGNATURE,
+        message="Invalid signature",
+        description="The signature verification failed",
+        http_status=401,
+        user_message="簽名驗證失敗"
+    ),
+
     # 會話管理錯誤
     ErrorCode.SESSION_NOT_FOUND: ErrorDetail(
         code=ErrorCode.SESSION_NOT_FOUND,
@@ -165,6 +203,14 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         description="The session ID format is invalid",
         http_status=400,
         user_message="會話ID格式不正確"
+    ),
+    ErrorCode.DUPLICATE_GRID_SESSION: ErrorDetail(
+        code=ErrorCode.DUPLICATE_GRID_SESSION,
+        message="Duplicate grid session",
+        description="A grid session already exists for this ticker-account combination",
+        http_status=409,
+        user_message="該交易對和帳戶組合已存在活躍的網格會話",
+        user_message_en="An active grid session already exists for this trading pair and account combination"
     ),
     
     # 交易相關錯誤
@@ -234,6 +280,40 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         user_message="當前價格超出設定範圍"
     ),
     
+    # 網格交易錯誤
+    ErrorCode.GRID_TRADING_ERROR: ErrorDetail(
+        code=ErrorCode.GRID_TRADING_ERROR,
+        message="Grid trading error",
+        description="An error occurred during grid trading operation",
+        http_status=500,
+        user_message="網格交易發生錯誤",
+        user_message_en="An error occurred during grid trading operation"
+    ),
+    ErrorCode.GRID_START_FAILED: ErrorDetail(
+        code=ErrorCode.GRID_START_FAILED,
+        message="Failed to start grid trading",
+        description="Failed to start the grid trading session",
+        http_status=500,
+        user_message="啟動網格交易失敗",
+        user_message_en="Failed to start grid trading session"
+    ),
+    ErrorCode.GRID_STOP_FAILED: ErrorDetail(
+        code=ErrorCode.GRID_STOP_FAILED,
+        message="Failed to stop grid trading",
+        description="Failed to stop the grid trading session",
+        http_status=500,
+        user_message="停止網格交易失敗",
+        user_message_en="Failed to stop grid trading session"
+    ),
+    ErrorCode.GRID_EXECUTION_ERROR: ErrorDetail(
+        code=ErrorCode.GRID_EXECUTION_ERROR,
+        message="Grid trading execution error",
+        description="An error occurred during grid trading execution",
+        http_status=500,
+        user_message="網格交易執行發生錯誤",
+        user_message_en="An error occurred during grid trading execution"
+    ),
+
     # 外部服務錯誤
     ErrorCode.ORDERLY_API_ERROR: ErrorDetail(
         code=ErrorCode.ORDERLY_API_ERROR,

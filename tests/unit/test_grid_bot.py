@@ -88,7 +88,7 @@ class TestGridTradingBot:
                 orderly_testnet=True
             )
 
-            bot._setup_websocket(
+            await bot._setup_websocket(
                 account_id="test_account_123",
                 orderly_key="test_key_123",
                 orderly_secret="test_secret_123",
@@ -112,7 +112,7 @@ class TestGridTradingBot:
             )
 
             # Should not raise error, just log warning
-            bot._setup_websocket(
+            await bot._setup_websocket(
                 account_id="test_account_123",
                 orderly_key="test_key_123",
                 orderly_secret="test_secret_123",
@@ -142,7 +142,15 @@ class TestGridTradingBot:
                     orderly_testnet=True
                 )
 
+                # Mock order tracker to return fully filled order
+                mock_order = Mock()
+                mock_order.is_fully_filled.return_value = True
+                bot.order_tracker.get_order = Mock(return_value=mock_order)
+                bot.order_tracker.add_fill = Mock()
+                bot.order_tracker.add_fill.return_value = None
+
                 bot.signal_generator = mock_signal
+                bot.is_running = True  # Enable processing
                 bot.active_orders[12345] = {
                     "price": Decimal("42500.50"),
                     "side": "BUY",
@@ -209,9 +217,9 @@ class TestGridTradingBot:
 
             await bot._create_grid_order(42500.50, "BUY")
 
-            assert 12345 in bot.active_orders
+            assert "grid_order_123" in bot.active_orders
             assert 42500.50 in bot.grid_orders
-            assert bot.grid_orders[42500.50] == 12345
+            assert bot.grid_orders[42500.50] == "grid_order_123"
 
     @pytest.mark.asyncio
     async def test_create_grid_order_duplicate(self):
@@ -238,7 +246,7 @@ class TestGridTradingBot:
 
             # Create first order
             await bot._create_grid_order(42500.50, "BUY")
-            assert bot.grid_orders[42500.50] == 12345
+            assert bot.grid_orders[42500.50] == "grid_order_123"
 
             # Try to create duplicate order
             await bot._create_grid_order(42500.50, "BUY")
@@ -246,7 +254,7 @@ class TestGridTradingBot:
 
             # Still only one order
             assert len(bot.active_orders) == 1
-            assert bot.grid_orders[42500.50] == 12345
+            assert bot.grid_orders[42500.50] == "grid_order_123"
 
     @pytest.mark.asyncio
     async def test_create_grid_order_api_failure(self):
@@ -295,6 +303,7 @@ class TestGridTradingBot:
 
             bot.market_info = Mock()
             bot.market_info.symbol = "PERP_BTC_USDC"
+            bot.is_running = True  # Enable processing
 
             signal = TradingSignal(
                 symbol="PERP_BTC_USDC",
@@ -329,6 +338,7 @@ class TestGridTradingBot:
 
             bot.profit_tracker = Mock()
             bot.profit_tracker.add_trade = Mock()
+            bot.is_running = True  # Enable processing
 
             signal = TradingSignal(
                 symbol="PERP_BTC_USDC",
@@ -376,43 +386,46 @@ class TestGridTradingBot:
     @pytest.mark.asyncio
     async def test_handle_signal_event_cancel_all(self):
         """Test handling CANCEL_ALL signal event."""
-        with patch('src.core.grid_bot.OrderlyClient') as mock_client_class:
-            mock_client = Mock()
-            mock_client.cancel_all_orders = AsyncMock(return_value={
-                "success": True,
-                "data": {"cancelled_count": 3}
-            })
-            mock_client_class.return_value = mock_client
+        bot = GridTradingBot(
+            account_id="test_account_123",
+            orderly_key="test_key_123",
+            orderly_secret="test_secret_123",
+            orderly_testnet=True
+        )
 
-            bot = GridTradingBot(
-                account_id="test_account_123",
-                orderly_key="test_key_123",
-                orderly_secret="test_secret_123",
-                orderly_testnet=True
-            )
+        # Mock the client after initialization
+        mock_client = Mock()
+        mock_client.cancel_all_orders = AsyncMock(return_value={
+            "success": True,
+            "data": {"cancelled_count": 3}
+        })
+        bot.client = mock_client
 
-            # Add some active orders
-            bot.active_orders[123] = {"price": 42500}
-            bot.active_orders[456] = {"price": 42600}
-            bot.grid_orders[42500] = 123
-            bot.grid_orders[42600] = 456
+        # Add some active orders
+        bot.active_orders[123] = {"price": 42500}
+        bot.active_orders[456] = {"price": 42600}
+        bot.grid_orders[42500] = 123
+        bot.grid_orders[42600] = 456
 
-            signal = TradingSignal(
-                symbol="PERP_BTC_USDC",
-                side=OrderSide.BUY,
-                price=Decimal("0"),
-                size=Decimal("0"),
-                signal_type="CANCEL_ALL"
-            )
+        # Set bot to running state
+        bot.is_running = True
 
-            await bot._handle_signal_event(signal)
+        signal = TradingSignal(
+            symbol="PERP_BTC_USDC",
+            side=OrderSide.BUY,
+            price=Decimal("0"),
+            size=Decimal("0"),
+            signal_type="CANCEL_ALL"
+        )
 
-            # Should cancel all orders
-            mock_client.cancel_all_orders.assert_called_once_with("PERP_BTC_USDC")
+        await bot._handle_signal_event(signal)
 
-            # Should clear active orders
-            assert len(bot.active_orders) == 0
-            assert len(bot.grid_orders) == 0
+        # Should cancel all orders
+        mock_client.cancel_all_orders.assert_called_once_with("PERP_BTC_USDC")
+
+        # Should clear active orders
+        assert len(bot.active_orders) == 0
+        assert len(bot.grid_orders) == 0
 
     @pytest.mark.asyncio
     async def test_handle_signal_event_bot_not_running(self):

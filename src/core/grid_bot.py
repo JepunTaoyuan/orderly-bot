@@ -9,7 +9,7 @@ import asyncio
 import json
 import time
 from decimal import Decimal
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 from .grid_signal import GridSignalGenerator, TradingSignal, Direction, OrderSide
 from .client import OrderlyClient
@@ -65,6 +65,14 @@ class GridTradingBot:
 
         # 記錄開始時間用於總結
         self.start_time: datetime = None
+
+        # 訂單恢復配置
+        from src.config.order_restoration_config import OrderRestorationConfig
+        self.restoration_config = OrderRestorationConfig()
+
+        # 恢復頻率追蹤
+        self.restoration_attempts = {}  # 時間 -> 恢復次數
+        self.last_restoration_cleanup = time.time()
 
         # WebSocket 事件去重
         self.processed_fills = {}
@@ -509,10 +517,58 @@ class GridTradingBot:
                                     "executed_price": executed_price,
                                     "executed_quantity": executed_quantity,
                                     "side": side,
+                                    "symbol": symbol,
                                     "fill_id": fill_id
                                 }
                                 if self.event_queue and self.main_loop:
                                     event = Event(EventType.ORDER_FILLED, fill_data)
+                                    # 線程安全地調度到主事件循環
+                                    asyncio.run_coroutine_threadsafe(
+                                        self.event_queue.add_event(event),
+                                        self.main_loop
+                                    )
+
+                        elif msg_type == "ORDER_CANCELLATION":
+                            content = payload.get("contentRaw") or payload.get("content")
+                            content_json = {}
+                            if isinstance(content, str):
+                                try:
+                                    content_json = json.loads(content)
+                                except Exception:
+                                    content_json = {}
+                            elif isinstance(content, dict):
+                                content_json = content
+
+                            order_id = content_json.get("orderId") or payload.get("orderId") or data.get("orderId")
+                            symbol = content_json.get("symbol") or ""
+                            side = content_json.get("side")
+                            cancel_reason = content_json.get("cancelReason", "UNKNOWN")
+                            cancel_timestamp = content_json.get("cancelTimestamp", 0)
+
+                            if order_id is None:
+                                logger.warning(f"ORDER_CANCELLATION 通知缺少 orderId，原始資料: {data}")
+                                return
+
+                            logger.info("訂單取消", event_type="order_cancellation", data={
+                                "order_id": order_id,
+                                "symbol": symbol,
+                                "side": side,
+                                "cancel_reason": cancel_reason,
+                                "timestamp": cancel_timestamp
+                            })
+
+                            metrics.increment_counter("orders.cancelled", tags={"reason": cancel_reason})
+
+                            if self.event_queue:
+                                cancel_data = {
+                                    "order_id": order_id,
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "cancel_reason": cancel_reason,
+                                    "timestamp": cancel_timestamp
+                                }
+                                if self.event_queue and self.main_loop:
+                                    event = Event(EventType.ORDER_CANCELLATION, cancel_data)
                                     # 線程安全地調度到主事件循環
                                     asyncio.run_coroutine_threadsafe(
                                         self.event_queue.add_event(event),
@@ -733,7 +789,7 @@ class GridTradingBot:
                 return
 
             # 🛡️ 安全檢查：確保只處理網格交易的成交
-            if self.market_info and symbol != self.market_info.symbol:
+            if self.market_info and symbol and symbol != self.market_info.symbol:
                 logger.debug(f"忽略非網格交易對的成交: {symbol} (網格: {self.market_info.symbol})")
                 return
 
@@ -764,7 +820,74 @@ class GridTradingBot:
             
         except Exception as e:
             logger.error(f"處理成交事件失敗: {e}, 數據: {fill_data}")
-    
+
+    async def _handle_order_cancellation_event(self, cancel_data: Dict[str, Any]):
+        """處理 WebSocket 訂單取消事件"""
+        try:
+            order_id = cancel_data.get('order_id')
+            symbol = cancel_data.get('symbol', '')
+            side = cancel_data.get('side')
+            cancel_reason = cancel_data.get('cancel_reason', 'UNKNOWN')
+            timestamp = cancel_data.get('timestamp', 0)
+
+            if not order_id:
+                logger.warning(f"取消事件缺少必要字段: {cancel_data}")
+                return
+
+            # 🛡️ 安全檢查：確保只處理網格交易的取消
+            if self.market_info and symbol != self.market_info.symbol:
+                logger.debug(f"忽略非網格交易對的取消: {symbol} (網格: {self.market_info.symbol})")
+                return
+
+            # 🛡️ 安全檢查：確保是我們的訂單
+            if order_id not in self.active_orders:
+                logger.debug(f"收到非網格訂單的取消通知: {order_id}, symbol: {symbol}")
+                return
+
+            cancel_type = self.restoration_config.get_cancellation_type(cancel_reason)
+
+            logger.info("檢測到網格訂單取消", event_type="order_cancellation_detected", data={
+                "order_id": order_id,
+                "symbol": symbol,
+                "side": side,
+                "cancel_reason": cancel_reason,
+                "cancel_type": cancel_type.value,
+                "timestamp": timestamp
+            })
+
+            metrics.increment_counter("orders.cancelled", tags={
+                "reason": cancel_reason,
+                "type": cancel_type.value
+            })
+
+            # 更新訂單狀態為已取消
+            async with self._orders_lock:
+                if order_id in self.active_orders:
+                    self.active_orders[order_id]["status"] = OrderStatus.CANCELLED
+                    logger.info(f"訂單 {order_id} 狀態已更新為 CANCELLED")
+
+            # 記錄取消事件
+            if "cancellation_history" not in self.order_statistics:
+                self.order_statistics["cancellation_history"] = []
+
+            self.order_statistics["cancellation_history"].append({
+                "timestamp": time.time(),
+                "order_id": order_id,
+                "cancel_reason": cancel_reason,
+                "cancel_type": cancel_type.value,
+                "will_attempt_restoration": self.restoration_config.should_restore_order(cancel_reason)
+            })
+
+            # 限制歷史記錄數量
+            if len(self.order_statistics["cancellation_history"]) > 100:
+                self.order_statistics["cancellation_history"] = self.order_statistics["cancellation_history"][-50:]
+
+            # 檢查是否需要恢復訂單
+            await self._check_and_restore_cancelled_order(order_id, cancel_reason, timestamp)
+
+        except Exception as e:
+            logger.error(f"處理取消事件失敗: {e}, 數據: {cancel_data}")
+
     async def _handle_order_filled(self, order_id: int, executed_price: float, executed_quantity: float, side: str):
         """
         處理訂單成交事件（整合利潤追蹤）
@@ -857,7 +980,7 @@ class GridTradingBot:
 
     
     @_track_concurrency("order")
-    async def _create_grid_order(self, price: float, side: str):
+    async def _create_grid_order(self, price: float, side: str, quantity: Optional[float] = None):
         """創建網格訂單"""
         start_time = time.time()
         try:
@@ -921,8 +1044,9 @@ class GridTradingBot:
                 self._register_pending_order(price, side)
                 self.grid_orders[price] = "PENDING"
             
-            # ⭐ 使用固定數量
-            quantity = float(self.signal_generator.quantity_per_grid)
+            # ⭐ 使用固定數量或指定數量
+            if quantity is None:
+                quantity = float(self.signal_generator.quantity_per_grid)
             
             # 驗證並標準化訂單
             if self.market_info:
@@ -1100,6 +1224,8 @@ class GridTradingBot:
                 await self._handle_signal_event(event.data)
             elif event.event_type == EventType.ORDER_FILLED:
                 await self._handle_order_filled_event(event.data)
+            elif event.event_type == EventType.ORDER_CANCELLATION:
+                await self._handle_order_cancellation_event(event.data)
         except Exception as e:
             logger.error(f"事件處理失敗: {e}")
     
@@ -1548,6 +1674,10 @@ class GridTradingBot:
             except Exception as e:
                 logger.error(f"WebSocket 啟動或訂閱 notifications 失敗: {e}")
                 # 注意：這裡不直接拋出異常，允許機器人繼續運行（稍後會重連）
+
+            # 啟動定期訂單同步任務
+            self.order_sync_task = asyncio.create_task(self._periodic_order_sync())
+            logger.info("定期訂單同步任務已啟動")
             
             # 創建訊號生成器（⭐ 使用新的固定數量版本）
             self.signal_generator = GridSignalGenerator(
@@ -1619,6 +1749,24 @@ class GridTradingBot:
             # 清除引用
             self.ws_reconnect_task = None
 
+        # 停止定期訂單同步任務
+        if hasattr(self, 'order_sync_task') and self.order_sync_task:
+            if not self.order_sync_task.done():
+                logger.info("正在停止定期訂單同步任務...")
+                try:
+                    self.order_sync_task.cancel()
+                    await asyncio.wait_for(self.order_sync_task, timeout=2.0)
+                    logger.info("定期訂單同步任務已停止")
+                except asyncio.TimeoutError:
+                    cleanup_errors.append("定期訂單同步任務停止超時")
+                    logger.warning("定期訂單同步任務停止超時，跳過")
+                except asyncio.CancelledError:
+                    logger.info("定期訂單同步任務已取消")
+                except Exception as e:
+                    cleanup_errors.append(f"定期訂單同步任務停止錯誤: {str(e)}")
+                    logger.warning(f"停止定期訂單同步任務時發生錯誤: {e}")
+            self.order_sync_task = None
+
         # 停止信號生成器
         if self.signal_generator:
             try:
@@ -1689,7 +1837,7 @@ class GridTradingBot:
         # 關閉 WebSocket 連接
         if self.wss_client:
             try:
-                await self._safe_close_ws()
+                self._safe_close_ws()
             except Exception as e:
                 cleanup_errors.append(f"WebSocket 關閉錯誤: {str(e)}")
                 logger.warning(f"關閉 WebSocket 連接時發生錯誤: {e}")
@@ -1738,21 +1886,54 @@ class GridTradingBot:
         if self.profit_tracker:
             try:
                 # 獲取當前市場價格
-                positions = await self.client.get_positions()
                 current_price = None
 
-                # 嘗試從持倉信息中獲取當前價格
-                for position in positions.get('data', {}).get('rows', []):
-                    if position.get('symbol') == self.profit_tracker.symbol:
-                        current_price = Decimal(str(position.get('mark_price', 0)))
-                        break
+                # 首先嘗試從持倉信息獲取價格
+                try:
+                    positions = await self.client.get_positions()
+                    for position in positions.get('data', {}).get('rows', []):
+                        if position.get('symbol') == self.profit_tracker.symbol:
+                            mark_price = position.get('mark_price')
+                            if mark_price and mark_price != 0:
+                                current_price = Decimal(str(mark_price))
+                                logger.debug(f"從持倉獲取價格: {current_price}")
+                                break
+                except Exception as e:
+                    logger.warning(f"從持倉獲取價格失敗: {e}")
+
+                # 如果沒有持倉，嘗試從訂單簿獲取中間價
+                if current_price is None:
+                    try:
+                        orderbook = await self.client.get_orderbook(self.profit_tracker.symbol)
+                        if orderbook and orderbook.get('data'):
+                            asks = orderbook['data'].get('asks', [])
+                            bids = orderbook['data'].get('bids', [])
+                            if asks and bids:
+                                best_ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) > 0 else None
+                                best_bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) > 0 else None
+                                if best_ask and best_bid:
+                                    current_price = (best_ask + best_bid) / 2
+                                    logger.debug(f"從訂單簿計算中間價: {current_price}")
+                    except Exception as e:
+                        logger.warning(f"從訂單簿獲取價格失敗: {e}")
 
                 # 獲取利潤統計摘要
                 profit_summary = self.profit_tracker.get_summary(current_price)
+
+                # 添加調試信息
+                profit_summary["debug_info"] = {
+                    "current_price_source": "positions" if current_price else "none",
+                    "current_price_value": str(current_price) if current_price else None,
+                    "has_positions": len(self.current_positions) > 0 if hasattr(self, 'current_positions') else False
+                }
+
                 status["profit_statistics"] = profit_summary
 
+                # 記錄調試日誌
+                logger.info(f"利潤統計已生成 - 當前價格: {current_price}, 網格收益: {profit_summary.get('grid_profit')}")
+
             except Exception as e:
-                logger.error(f"獲取利潤統計失敗: {e}")
+                logger.error(f"獲取利潤統計失敗: {e}", exc_info=True)
                 status["profit_statistics"] = {"error": str(e)}
 
         # ⭐ 新增：包含API速率統計
@@ -1821,13 +2002,34 @@ class GridTradingBot:
 
         try:
             # 獲取當前價格
-            positions = await self.client.get_positions()
             current_price = None
 
-            for position in positions.get('data', {}).get('rows', []):
-                if position.get('symbol') == self.profit_tracker.symbol:
-                    current_price = Decimal(str(position.get('mark_price', 0)))
-                    break
+            # 首先嘗試從持倉信息獲取價格
+            try:
+                positions = await self.client.get_positions()
+                for position in positions.get('data', {}).get('rows', []):
+                    if position.get('symbol') == self.profit_tracker.symbol:
+                        mark_price = position.get('mark_price')
+                        if mark_price and mark_price != 0:
+                            current_price = Decimal(str(mark_price))
+                            break
+            except Exception as e:
+                logger.warning(f"從持倉獲取價格失敗: {e}")
+
+            # 如果沒有持倉，嘗試從訂單簿獲取中間價
+            if current_price is None:
+                try:
+                    orderbook = await self.client.get_orderbook(self.profit_tracker.symbol)
+                    if orderbook and orderbook.get('data'):
+                        asks = orderbook['data'].get('asks', [])
+                        bids = orderbook['data'].get('bids', [])
+                        if asks and bids:
+                            best_ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) > 0 else None
+                            best_bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) > 0 else None
+                            if best_ask and best_bid:
+                                current_price = (best_ask + best_bid) / 2
+                except Exception as e:
+                    logger.warning(f"從訂單簿獲取價格失敗: {e}")
 
             # 獲取完整報告
             return {
@@ -1859,13 +2061,34 @@ class GridTradingBot:
                 return
 
             # 獲取當前價格
-            positions = await self.client.get_positions()
             current_price = None
 
-            for position in positions.get('data', {}).get('rows', []):
-                if position.get('symbol') == self.profit_tracker.symbol:
-                    current_price = Decimal(str(position.get('mark_price', 0)))
-                    break
+            # 首先嘗試從持倉信息獲取價格
+            try:
+                positions = await self.client.get_positions()
+                for position in positions.get('data', {}).get('rows', []):
+                    if position.get('symbol') == self.profit_tracker.symbol:
+                        mark_price = position.get('mark_price')
+                        if mark_price and mark_price != 0:
+                            current_price = Decimal(str(mark_price))
+                            break
+            except Exception as e:
+                logger.warning(f"從持倉獲取價格失敗: {e}")
+
+            # 如果沒有持倉，嘗試從訂單簿獲取中間價
+            if current_price is None:
+                try:
+                    orderbook = await self.client.get_orderbook(self.profit_tracker.symbol)
+                    if orderbook and orderbook.get('data'):
+                        asks = orderbook['data'].get('asks', [])
+                        bids = orderbook['data'].get('bids', [])
+                        if asks and bids:
+                            best_ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) > 0 else None
+                            best_bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) > 0 else None
+                            if best_ask and best_bid:
+                                current_price = (best_ask + best_bid) / 2
+                except Exception as e:
+                    logger.warning(f"從訂單簿獲取價格失敗: {e}")
 
             # 獲取利潤摘要
             profit_summary = self.profit_tracker.get_summary(current_price)
@@ -2340,3 +2563,346 @@ class GridTradingBot:
             })
 
         return anomalies
+
+    async def _check_and_restore_cancelled_order(self, order_id: str, cancel_reason: str, timestamp: int):
+        """檢查並恢復被取消的訂單"""
+        try:
+            # 檢查是否是用戶取消且需要恢復
+            if not self._should_restore_order(cancel_reason):
+                logger.info(f"訂單 {order_id} 取消原因為 {cancel_reason}，無需恢復")
+                return
+
+            # 獲取被取消訂單的信息
+            cancelled_order = None
+            tracker_order = None
+            async with self._orders_lock:
+                if order_id in self.active_orders:
+                    cancelled_order = self.active_orders[order_id]
+            try:
+                tracker_order = self.order_tracker.get_order(int(order_id))
+            except Exception:
+                tracker_order = None
+
+            if not cancelled_order and not tracker_order:
+                logger.warning(f"無法找到被取消的訂單 {order_id}")
+                return
+
+            # 檢查恢復條件
+            if await self._can_restore_order(cancelled_order or tracker_order, timestamp):
+                logger.info(f"開始恢復被取消的訂單 {order_id}")
+                await self._restore_cancelled_order(tracker_order or cancelled_order)
+            else:
+                logger.info(f"訂單 {order_id} 不滿足恢復條件")
+
+        except Exception as e:
+            logger.error(f"檢查和恢復訂單 {order_id} 失敗: {e}")
+
+    def _should_restore_order(self, cancel_reason: str) -> bool:
+        """根據配置判斷是否應該恢復訂單"""
+        return self.restoration_config.should_restore_order(cancel_reason)
+
+    async def _can_restore_order(self, cancelled_order: 'OrderInfo', timestamp: int) -> bool:
+        """檢查是否可以恢復訂單"""
+        try:
+            import time
+            current_time = time.time()
+
+            # 檢查是否還在運行狀態
+            if not self.is_running:
+                logger.info("網格機器人已停止，跳過恢復訂單")
+                return False
+
+            # 檢查時間窗口（如果啟用）
+            if self.restoration_config.enable_time_window_check:
+                if timestamp > 0 and (current_time - timestamp/1000) > self.restoration_config.max_restore_window_seconds:
+                    logger.info(f"訂單取消時間超過恢復窗口，跳過恢復")
+                    return False
+
+            # 檢查當前市場價格是否還在合理範圍內（如果啟用）
+            if self.restoration_config.enable_price_check and self.market_info:
+                current_price = await self._get_current_price()
+                if current_price:
+                    price_deviation = abs(cancelled_order.price - current_price) / current_price
+                    max_deviation = self.restoration_config.max_price_deviation_percent / 100
+                    if price_deviation > max_deviation:
+                        logger.warning(f"價格偏差過大 {price_deviation:.2%}，跳過恢復訂單")
+                        return False
+
+            # 檢查恢復頻率限制
+            if not self._check_restoration_rate_limit():
+                logger.warning("恢復頻率超過限制，跳過恢復訂單")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"檢查訂單恢復條件失敗: {e}")
+            return False
+
+    def _check_restoration_rate_limit(self) -> bool:
+        """檢查恢復頻率限制"""
+        try:
+            current_time = time.time()
+
+            # 清理過期的記錄（每小時）
+            if current_time - self.last_restoration_cleanup > 3600:
+                self._cleanup_restoration_attempts()
+                self.last_restoration_cleanup = current_time
+
+            # 計算當前小時的恢復次數
+            current_hour = int(current_time // 3600)
+            attempts_this_hour = self.restoration_attempts.get(current_hour, 0)
+
+            max_attempts = self.restoration_config.max_restoration_attempts_per_hour
+
+            if attempts_this_hour >= max_attempts:
+                logger.warning(f"已達到本小時恢復次數限制: {attempts_this_hour}/{max_attempts}")
+                return False
+
+            # 記錄這次恢復嘗試
+            self.restoration_attempts[current_hour] = attempts_this_hour + 1
+            return True
+
+        except Exception as e:
+            logger.error(f"檢查恢復頻率限制失敗: {e}")
+            # 出錯時允許恢復，避免阻塞正常功能
+            return True
+
+    def _cleanup_restoration_attempts(self):
+        """清理過期的恢復嘗試記錄"""
+        try:
+            current_time = time.time()
+            current_hour = int(current_time // 3600)
+
+            # 只保留最近24小時的記錄
+            hours_to_keep = 24
+            cutoff_hour = current_hour - hours_to_keep
+
+            # 清理舊記錄
+            old_hours = [h for h in self.restoration_attempts.keys() if h < cutoff_hour]
+            for hour in old_hours:
+                del self.restoration_attempts[hour]
+
+            if old_hours:
+                logger.debug(f"清理了 {len(old_hours)} 個過期的恢復嘗試記錄")
+
+        except Exception as e:
+            logger.error(f"清理恢復嘗試記錄失敗: {e}")
+
+    async def _restore_cancelled_order(self, cancelled_order: 'OrderInfo'):
+        """恢復被取消的訂單"""
+        try:
+            original_order_id = getattr(cancelled_order, 'order_id', None) or cancelled_order.get('order_id')
+            price_to_use = (getattr(cancelled_order, 'original_price', None) 
+                            if hasattr(cancelled_order, 'original_price') else cancelled_order.get('price'))
+            side_to_use = getattr(cancelled_order, 'side', None) or cancelled_order.get('side')
+            quantity_to_use = (getattr(cancelled_order, 'original_quantity', None) 
+                               if hasattr(cancelled_order, 'original_quantity') else cancelled_order.get('quantity'))
+
+            logger.info("開始恢復訂單", event_type="order_restoration_start", data={
+                "original_order_id": original_order_id,
+                "price": price_to_use,
+                "side": side_to_use,
+                "quantity": quantity_to_use
+            })
+
+            # 創建新的訂單
+            await self._create_grid_order(
+                price=float(price_to_use),
+                side=side_to_use,
+                quantity=float(quantity_to_use) if quantity_to_use is not None else None
+            )
+
+            new_order_id = None
+            async with self._orders_lock:
+                try:
+                    new_order_id = self.grid_orders.get(float(price_to_use))
+                except Exception:
+                    new_order_id = None
+
+            if new_order_id and new_order_id != "PENDING":
+                logger.info("訂單恢復成功", event_type="order_restoration_success", data={
+                    "original_order_id": original_order_id,
+                    "new_order_id": new_order_id,
+                    "price": price_to_use,
+                    "side": side_to_use
+                })
+                metrics.increment_counter("orders.restored", tags={"side": cancelled_order.side})
+
+                # 更新統計信息
+                self.order_statistics["orders_restored"] = self.order_statistics.get("orders_restored", 0) + 1
+
+                # 記錄恢復詳細信息
+                if "restoration_history" not in self.order_statistics:
+                    self.order_statistics["restoration_history"] = []
+
+                self.order_statistics["restoration_history"].append({
+                    "timestamp": time.time(),
+                    "original_order_id": original_order_id,
+                    "new_order_id": new_order_id,
+                    "price": price_to_use,
+                    "side": side_to_use
+                })
+
+                # 限制歷史記錄數量
+                if len(self.order_statistics["restoration_history"]) > 100:
+                    self.order_statistics["restoration_history"] = self.order_statistics["restoration_history"][-50:]
+
+            else:
+                logger.error("訂單恢復失敗", event_type="order_restoration_failed", data={
+                    "original_order_id": original_order_id,
+                    "price": price_to_use,
+                    "side": side_to_use,
+                    "reason": "order_creation_failed"
+                })
+                metrics.increment_counter("orders.restoration_failed", tags={"side": side_to_use})
+
+        except Exception as e:
+            original_order_id = getattr(cancelled_order, 'order_id', None) or cancelled_order.get('order_id')
+            side_to_use = getattr(cancelled_order, 'side', None) or cancelled_order.get('side')
+            logger.error("訂單恢復異常", event_type="order_restoration_error", data={
+                "original_order_id": original_order_id,
+                "error": str(e)
+            })
+            metrics.increment_counter("orders.restoration_errors", tags={"side": side_to_use})
+
+    async def _get_current_price(self) -> Optional[float]:
+        """獲取當前市場價格"""
+        try:
+            try:
+                positions = await self.client.get_positions()
+                for position in positions.get('data', {}).get('rows', []):
+                    if position.get('symbol') == (self.market_info.symbol if self.market_info else None):
+                        mark_price = position.get('mark_price')
+                        if mark_price and mark_price != 0:
+                            return float(mark_price)
+            except Exception:
+                pass
+
+            try:
+                orderbook = await self.client.get_orderbook(self.market_info.symbol)
+                if orderbook and orderbook.get('data'):
+                    asks = orderbook['data'].get('asks', [])
+                    bids = orderbook['data'].get('bids', [])
+                    if asks and bids and len(asks[0]) > 0 and len(bids[0]) > 0:
+                        best_ask = float(asks[0][0])
+                        best_bid = float(bids[0][0])
+                        return (best_ask + best_bid) / 2.0
+            except Exception:
+                pass
+
+            return None
+
+        except Exception as e:
+            logger.error(f"獲取當前價格失敗: {e}")
+            return None
+
+    async def _periodic_order_sync(self):
+        """定期同步訂單狀態，捕獲錯過的取消事件"""
+        try:
+            sync_interval = self.restoration_config.order_sync_interval_seconds
+            logger.info(f"開始定期訂單同步，間隔: {sync_interval}秒")
+
+            while self.is_running:
+                try:
+                    await asyncio.sleep(sync_interval)
+
+                    if not self.is_running:
+                        break
+
+                    await self._sync_order_states()
+
+                except asyncio.CancelledError:
+                    logger.info("定期訂單同步任務被取消")
+                    break
+                except Exception as e:
+                    logger.error(f"定期訂單同步失敗: {e}")
+                    # 繼續運行，不因單次失敗而停止
+
+        except Exception as e:
+            logger.error(f"定期訂單同步任務異常: {e}")
+
+    async def _sync_order_states(self):
+        """同步訂單狀態"""
+        try:
+            if not self.client or not self.market_info:
+                return
+
+            # 獲取當前所有活躍訂單
+            response = await self.client.get_orders(
+                symbol=self.market_info.symbol,
+                status='OPEN'
+            )
+
+            if not response or not response.get('data'):
+                return
+
+            # 創建當前訂單ID集合
+            current_rows = response.get('data', {}).get('rows', [])
+            current_order_ids = {str(order.get('order_id')) for order in current_rows}
+
+            # 檢查我們追蹤的訂單中哪些已經不在交易所
+            cancelled_orders = []
+            async with self._orders_lock:
+                for order_id, order_info in list(self.active_orders.items()):
+                    status_val = order_info.get("status")
+                    if (order_id not in current_order_ids and
+                        status_val != OrderStatus.CANCELLED and
+                        status_val != OrderStatus.FILLED):
+
+                        # 標記為可能被外部取消
+                        order_info["status"] = OrderStatus.CANCELLED
+                        cancelled_orders.append(order_info)
+
+            # 處理被取消的訂單
+            for cancelled_order in cancelled_orders:
+                logger.info(f"檢測到外部取消的訂單: {cancelled_order.order_id}")
+
+                # 觸發恢復邏輯
+                await self._check_and_restore_cancelled_order(
+                    str(cancelled_order.order_id),
+                    "EXTERNAL_CANCEL_DETECTED",
+                    int(time.time() * 1000)
+                )
+
+        except Exception as e:
+            logger.error(f"同步訂單狀態失敗: {e}")
+
+    def configure_restoration(self, config: Dict[str, Any]):
+        """配置訂單恢復設置"""
+        try:
+            from src.config.order_restoration_config import OrderRestorationConfig
+            self.restoration_config = OrderRestorationConfig.from_dict(config)
+            logger.info(f"訂單恢復配置已更新: {config}")
+        except Exception as e:
+            logger.error(f"更新訂單恢復配置失敗: {e}")
+
+    def get_restoration_config(self) -> Dict[str, Any]:
+        """獲取當前恢復配置"""
+        return self.restoration_config.to_dict()
+
+    def get_restoration_statistics(self) -> Dict[str, Any]:
+        """獲取恢復統計信息"""
+        current_time = time.time()
+        current_hour = int(current_time // 3600)
+        attempts_this_hour = self.restoration_attempts.get(current_hour, 0)
+
+        # 計算最近24小時的總恢復次數
+        recent_attempts = sum(
+            count for hour, count in self.restoration_attempts.items()
+            if hour >= current_hour - 24
+        )
+
+        return {
+            "orders_restored": self.order_statistics.get("orders_restored", 0),
+            "restoration_config": self.get_restoration_config(),
+            "active_orders_count": len(self.active_orders),
+            "is_restoration_enabled": self.restoration_config.restoration_policy.value != "never",
+            "rate_limit": {
+                "attempts_this_hour": attempts_this_hour,
+                "max_attempts_per_hour": self.restoration_config.max_restoration_attempts_per_hour,
+                "attempts_last_24h": recent_attempts
+            },
+            "recent_restorations": self.order_statistics.get("restoration_history", [])[-10:],  # 最近10次
+            "restoration_rate_limit_hours": list(self.restoration_attempts.keys())[-5:]  # 最近5小時的記錄
+        }

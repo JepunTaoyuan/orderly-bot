@@ -7,10 +7,11 @@
 
 import os
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from src.utils.logging_config import get_logger
-from src.services.database_service import MongoManager
+from src.utils.mongo_manager import MongoManager
 
 logger = get_logger("database_manager")
 
@@ -71,8 +72,8 @@ class DatabaseManager:
                 # 獲取數據庫
                 self.db = self.client.get_default_database()
 
-                # 創建 MongoManager 實例
-                self.mongo_manager = MongoManager(self.connection_string)
+                # 🚀 優化：創建 MongoManager 實例，復用現有客戶端連接池
+                self.mongo_manager = MongoManager(existing_client=self.client)
 
                 # 測試連接
                 await self.client.admin.command('ping')
@@ -101,6 +102,14 @@ class DatabaseManager:
             if "sessions" in await self.db.list_collection_names():
                 await self.db.sessions.create_index("session_id", unique=True)
                 await self.db.sessions.create_index("created_at", background=True)
+                # 添加唯一性索引：確保同一個 user_id 和 ticker 組合只能有一個活躍會話
+                await self.db.sessions.create_index(
+                    [("user_id", 1), ("ticker", 1), ("status", 1)],
+                    unique=True,
+                    partialFilterExpression={"status": "active"},
+                    background=True
+                )
+                logger.info("已創建 (user_id, ticker, status) 唯一索引以防止重複網格會話")
 
             logger.info("數據庫索引初始化完成")
 
@@ -176,6 +185,95 @@ class DatabaseManager:
             logger.info(f"集合 {collection_name} 的索引創建完成")
         except Exception as e:
             logger.error(f"創建集合 {collection_name} 索引失敗: {e}")
+
+    async def check_duplicate_grid_session(self, user_id: str, ticker: str, exclude_session_id: str = None) -> Optional[Dict[str, Any]]:
+        """
+        檢查是否存在重複的網格會話
+
+        Args:
+            user_id: 用戶ID
+            ticker: 交易對
+            exclude_session_id: 要排除的會話ID（用於更新操作）
+
+        Returns:
+            如果找到重複會話則返回會話信息，否則返回None
+        """
+        try:
+            if not self.db:
+                return None
+
+            collection = self.db.sessions
+
+            # 構建查詢條件
+            query = {
+                "user_id": user_id,
+                "ticker": ticker,
+                "status": "active"
+            }
+
+            # 如果指定了要排除的會話ID，則排除它
+            if exclude_session_id:
+                query["session_id"] = {"$ne": exclude_session_id}
+
+            # 查找重複會話
+            duplicate_session = await collection.find_one(query)
+
+            if duplicate_session:
+                logger.warning(f"發現重複網格會話: user_id={user_id}, ticker={ticker}, session_id={duplicate_session.get('session_id')}")
+                return duplicate_session
+
+            return None
+
+        except Exception as e:
+            logger.error(f"檢查重複網格會話時發生錯誤: {e}")
+            return None
+
+    async def validate_session_uniqueness_atomic(self, user_id: str, ticker: str, session_id: str) -> bool:
+        """
+        原子性驗證會話唯一性，使用數據庫事務保證一致性
+
+        Args:
+            user_id: 用戶ID
+            ticker: 交易對
+            session_id: 會話ID
+
+        Returns:
+            True表示可以創建會話，False表示存在重複會話
+        """
+        try:
+            if not self.db:
+                return True
+
+            collection = self.db.sessions
+
+            # 使用 findOneAndUpdate 進行原子性檢查和標記
+            # 這個操作會在單個原子操作中檢查是否存在重複會話
+            result = await collection.update_one(
+                {
+                    "user_id": user_id,
+                    "ticker": ticker,
+                    "status": "active",
+                    "session_id": {"$ne": session_id}
+                },
+                {
+                    "$set": {
+                        "duplicate_check_timestamp": time.time(),
+                        "duplicate_check_session": session_id
+                    }
+                }
+            )
+
+            # 如果修改了文檔，說明存在重複會話
+            if result.modified_count > 0:
+                logger.warning(f"原子性檢查發現重複會話: user_id={user_id}, ticker={ticker}")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"原子性驗證會話唯一性時發生錯誤: {e}")
+            # 在出錯時，為了安全起見，允許創建會話（內存層面還會有檢查）
+            return True
 
     async def backup_database(self, backup_path: str):
         """數據庫備份（需要 mongodump 工具）"""

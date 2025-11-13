@@ -607,6 +607,18 @@ class OrderlyClient:
         except Exception as e:
             logger.error(f"獲取訂單列表失敗: {e}")
             raise
+
+    async def get_orderbook(self, symbol: str) -> Dict[str, Any]:
+        """
+        獲取訂單簿資料（為利潤與價格推估提供支援）
+        """
+        try:
+            response = await self.client.get_orderbook(symbol=symbol)
+            logger.info("獲取訂單簿成功")
+            return response
+        except Exception as e:
+            logger.error(f"獲取訂單簿失敗: {e}")
+            raise
     
     async def close_position(self, symbol: str, quantity: Optional[float] = None) -> Dict[str, Any]:
         """

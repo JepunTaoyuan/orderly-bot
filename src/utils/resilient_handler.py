@@ -156,24 +156,26 @@ class RetryHandler:
             if isinstance(exception, exc_type):
                 return False
 
-        # 檢查重試異常
-        for exc_type in config.retryable_exceptions:
-            if isinstance(exception, exc_type):
-                return True
-
-        # 特殊處理 GridTradingException
+        # 特殊處理 GridTradingException - 優先檢查
         if isinstance(exception, GridTradingException):
             # 某些錯誤碼不應重試
             non_retryable_codes = {
                 ErrorCode.INVALID_REQUEST,
-                ErrorCode.INVALID_SIGNATURE,
                 ErrorCode.USER_NOT_FOUND,
                 ErrorCode.USER_ALREADY_EXISTS,
                 ErrorCode.SESSION_ALREADY_EXISTS,
                 ErrorCode.SESSION_NOT_FOUND,
+                ErrorCode.DUPLICATE_GRID_SESSION,
             }
             if exception.error_code in non_retryable_codes:
                 return False
+            # 其他 GridTradingException 默認可重試
+            return True
+
+        # 檢查重試異常
+        for exc_type in config.retryable_exceptions:
+            if isinstance(exception, exc_type):
+                return True
 
         # 默認不重試未知異常
         return False
