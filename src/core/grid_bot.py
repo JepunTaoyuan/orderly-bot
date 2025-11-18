@@ -8,9 +8,11 @@
 import asyncio
 import json
 import time
+import errno
 from decimal import Decimal
 from typing import Dict, Any, Optional
 from datetime import datetime
+from enum import Enum
 from .grid_signal import GridSignalGenerator, TradingSignal, Direction, OrderSide
 from .client import OrderlyClient
 from .profit_tracker import ProfitTracker  # ⭐ 新增利潤追蹤
@@ -24,16 +26,108 @@ from src.utils.websocket_manager import get_websocket_manager, WSConnectionState
 
 logger = get_logger("grid_bot")
 
+
+class CircuitBreakerState(Enum):
+    """Circuit breaker 狀態枚舉"""
+    CLOSED = "closed"      # 正常運行
+    OPEN = "open"          # 斷路，阻止執行
+    HALF_OPEN = "half_open"  # 半開，允許少量測試請求
+
+
+class WebSocketCircuitBreaker:
+    """WebSocket 重連斷路器"""
+
+    def __init__(self,
+                 failure_threshold: int = 5,      # 失敗閾值
+                 recovery_timeout: int = 60,      # 恢復超時（秒）
+                 half_open_max_calls: int = 3):   # 半開狀態最大調用次數
+
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.half_open_calls = 0
+        self.state = CircuitBreakerState.CLOSED
+
+    def can_execute(self) -> bool:
+        """檢查是否可以執行操作"""
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+
+        if self.state == CircuitBreakerState.OPEN:
+            # 檢查是否可以轉為半開狀態
+            if (time.time() - self.last_failure_time) >= self.recovery_timeout:
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.half_open_calls = 0
+                logger.info("Circuit breaker 轉為 HALF_OPEN 狀態")
+                return True
+            return False
+
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            return self.half_open_calls < self.half_open_max_calls
+
+        return False
+
+    def record_success(self):
+        """記錄成功"""
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.half_open_calls += 1
+            if self.half_open_calls >= self.half_open_max_calls:
+                self.reset()
+                logger.info("Circuit breaker 恢復到 CLOSED 狀態")
+
+    def record_failure(self):
+        """記錄失敗"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+
+        if (self.state == CircuitBreakerState.HALF_OPEN or
+            self.failure_count >= self.failure_threshold):
+            self.state = CircuitBreakerState.OPEN
+            logger.warning(
+                "Circuit breaker 轉為 OPEN 狀態",
+                data={
+                    "failure_count": self.failure_count,
+                    "threshold": self.failure_threshold,
+                    "recovery_timeout": self.recovery_timeout
+                }
+            )
+
+    def reset(self):
+        """重置斷路器"""
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.half_open_calls = 0
+        self.state = CircuitBreakerState.CLOSED
+
+    def get_status(self) -> Dict[str, Any]:
+        """獲取斷路器狀態"""
+        return {
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "last_failure_time": self.last_failure_time,
+            "half_open_calls": self.half_open_calls,
+            "can_execute": self.can_execute()
+        }
+
+
 class GridTradingBot:
     # 常數定義
     PROCESSED_FILLS_MAX_SIZE = 1000
     PROCESSED_FILLS_TTL = 300
     ORDER_CREATION_DELAY = 0.1
 
-    # WebSocket 重連配置
-    WS_RECONNECT_MAX_RETRIES = 5
-    WS_RECONNECT_BASE_DELAY = 2  # 秒
-    WS_RECONNECT_MAX_DELAY = 60  # 秒
+    # WebSocket 重連配置（優化用於 Docker 環境）
+    WS_RECONNECT_MAX_RETRIES = 8      # 增加重試次數
+    WS_RECONNECT_BASE_DELAY = 3       # 增加基礎延遲
+    WS_RECONNECT_MAX_DELAY = 120      # 增加最大延遲
+
+    # Docker 環境特定配置
+    DOCKER_BROKEN_PIPE_DELAY = 7      # Broken pipe 錯誤的額外延遲
+    DOCKER_CONNECTION_TIMEOUT = 45    # 連接超時時間
+    DOCKER_HEALTH_CHECK_INTERVAL = 90 # 健康檢查間隔
 
     def __init__(self, account_id: str, orderly_key: str, orderly_secret: str, orderly_testnet: bool):
         """初始化網格交易機器人"""
@@ -56,6 +150,35 @@ class GridTradingBot:
         self.ws_reconnect_attempts = 0
         self.ws_should_reconnect = True  # 控制是否應該重連
         self.ws_credentials = None  # 保存 WebSocket 憑證
+
+        # 斷路器配置（Docker 環境優化）
+        self.ws_circuit_breaker = WebSocketCircuitBreaker(
+            failure_threshold=6,      # 增加失敗閾值
+            recovery_timeout=120,     # 增加恢復超時
+            half_open_max_calls=2     # 減少半開狀態測試次數
+        )
+
+        # 連接健康監控配置
+        self.ws_health_metrics = {
+            "last_success_time": None,
+            "last_error_time": None,
+            "total_attempts": 0,
+            "success_count": 0,
+            "error_count": 0,
+            "broken_pipe_count": 0,
+            "auth_error_count": 0,
+            "connection_uptime": 0,
+            "avg_connection_duration": 0
+        }
+
+        # 線程安全鎖
+        self._ws_state_lock = asyncio.Lock()
+        self._callback_lock = asyncio.Lock()
+
+        # 健康監控配置（Docker 環境優化）
+        self._health_monitor_task = None
+        self._last_health_check = None
+        self._health_check_interval = self.DOCKER_HEALTH_CHECK_INTERVAL
         
         # ⭐ 新增：利潤追蹤器
         self.profit_tracker: ProfitTracker = None
@@ -402,65 +525,114 @@ class GridTradingBot:
             def on_close(_):
                 logger.warning("WebSocket 連接已關閉")
 
-                # 更新連接狀態（線程安全）
-                if self.session_id and self.main_loop:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._update_ws_state(WSConnectionState.DISCONNECTED),
-                            self.main_loop
-                        )
-                    except Exception as e:
-                        logger.error(f"更新 WebSocket 狀態失敗: {e}")
+                # 線程安全地更新連接狀態
+                if self.session_id:
+                    self._safe_schedule_coroutine(
+                        self._threadsafe_update_ws_state(WSConnectionState.DISCONNECTED),
+                        "WebSocket 狀態更新"
+                    )
 
                 # 如果機器人還在運行且應該重連，則觸發重連
                 if self.is_running and self.ws_should_reconnect:
                     logger.info("檢測到 WebSocket 意外關閉，準備重連")
                     # 使用線程安全的方式調度重連任務
-                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()) and self.main_loop:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                self._handle_ws_reconnect(),
-                                self.main_loop
-                            )
-                        except Exception as e:
-                            logger.error(f"觸發 WebSocket 重連失敗: {e}")
+                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()):
+                        self._safe_schedule_coroutine(
+                            self._handle_ws_reconnect(),
+                            "WebSocket 重連處理"
+                        )
 
             def on_error(_, error):
                 """WebSocket 錯誤處理"""
-                logger.error(f"WebSocket 錯誤: {error}", event_type="websocket_error")
-                if "authentication" in str(error).lower() or "auth" in str(error).lower():
-                    logger.critical("WebSocket 認證失敗，停止交易")
-                    if self.main_loop:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                self.stop_grid_trading(),
-                                self.main_loop
-                            )
-                        except Exception as e:
-                            logger.error(f"停止交易失敗: {e}")
-                    return
+                error_str = str(error)
+                error_type = type(error).__name__
 
-                # 更新連接狀態為失敗（線程安全）
-                if self.session_id and self.main_loop:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._update_ws_state(WSConnectionState.FAILED),
-                            self.main_loop
-                        )
-                    except Exception as e:
-                        logger.error(f"更新 WebSocket 狀態失敗: {e}")
+                # 檢查是否為 Broken pipe 錯誤
+                is_broken_pipe = (
+                    errno.EPIPE in error_str or
+                    "Broken pipe" in error_str or
+                    "Errno 32" in error_str or
+                    (hasattr(error, 'errno') and error.errno == errno.EPIPE)
+                )
+
+                if is_broken_pipe:
+                    # 線程安全地更新健康指標
+                    self._threadsafe_increment_metric("broken_pipe_count")
+                    self.ws_health_metrics["last_error_time"] = time.time()
+
+                    logger.warning(
+                        "檢測到 Broken pipe 錯誤，這通常表示網路連接中斷",
+                        event_type="websocket_broken_pipe",
+                        data={
+                            "error_type": error_type,
+                            "error_message": error_str,
+                            "will_reconnect": self.is_running and self.ws_should_reconnect,
+                            "broken_pipe_count": self.ws_health_metrics["broken_pipe_count"],
+                            "circuit_breaker_status": self.ws_circuit_breaker.get_status()
+                        }
+                    )
+                elif "authentication" in error_str.lower() or "auth" in error_str.lower():
+                    # 線程安全地更新健康指標
+                    self._threadsafe_increment_metric("auth_error_count")
+                    self.ws_health_metrics["last_error_time"] = time.time()
+
+                    logger.critical(
+                        "WebSocket 認證失敗，停止交易",
+                        event_type="websocket_auth_error",
+                        data={
+                            "error_type": error_type,
+                            "error_message": error_str,
+                            "auth_error_count": self.ws_health_metrics["auth_error_count"]
+                        }
+                    )
+                    self._safe_schedule_coroutine(
+                        self.stop_grid_trading(),
+                        "停止交易（認證失敗）"
+                    )
+                    return
+                else:
+                    logger.error(
+                        f"WebSocket 錯誤: {error}",
+                        event_type="websocket_error",
+                        data={
+                            "error_type": error_type,
+                            "error_message": error_str
+                        }
+                    )
+
+                # 線程安全地更新連接狀態
+                if self.session_id:
+                    target_state = WSConnectionState.DISCONNECTED if is_broken_pipe else WSConnectionState.FAILED
+                    self._safe_schedule_coroutine(
+                        self._threadsafe_update_ws_state(target_state),
+                        f"WebSocket 狀態更新（{target_state.value}）"
+                    )
+
+                # 為 Broken pipe 錯誤添加額外延遲，避免過快重連
+                reconnect_delay = 0
+                if is_broken_pipe:
+                    # Docker 環境下的 Broken pipe 需要更長的恢復時間
+                    reconnect_delay = self.DOCKER_BROKEN_PIPE_DELAY
+                    logger.info(f"Broken pipe 錯誤，將在 {reconnect_delay} 秒後重連")
 
                 # 其他錯誤觸發重連
                 if self.is_running and self.ws_should_reconnect:
                     logger.info("WebSocket 錯誤，準備重連")
-                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()) and self.main_loop:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                self._handle_ws_reconnect(),
-                                self.main_loop
+                    if (self.ws_reconnect_task is None or self.ws_reconnect_task.done()):
+                        if reconnect_delay > 0:
+                            # 創建延遲重連任務
+                            async def delayed_reconnect():
+                                await asyncio.sleep(reconnect_delay)
+                                await self._handle_ws_reconnect()
+                            self._safe_schedule_coroutine(
+                                delayed_reconnect(),
+                                f"延遲 WebSocket 重連（{reconnect_delay}s）"
                             )
-                        except Exception as e:
-                            logger.error(f"觸發 WebSocket 重連失敗: {e}")
+                        else:
+                            self._safe_schedule_coroutine(
+                                self._handle_ws_reconnect(),
+                                "WebSocket 重連處理"
+                            )
 
             def on_message(_, message):
                 """處理 WebSocket 訊息"""
@@ -607,44 +779,425 @@ class GridTradingBot:
             self.wss_client = None
 
     async def _update_ws_state(self, state: WSConnectionState):
-        """更新 WebSocket 連接狀態"""
+        """更新 WebSocket 連接狀態到管理器"""
         if self.session_id:
             ws_manager = get_websocket_manager()
             await ws_manager.set_connection_state(self.session_id, state)
 
+            # 記錄詳細的狀態變更
+            self._log_connection_state_change(state)
+
+    def _log_connection_state_change(self, state: WSConnectionState):
+        """記錄連接狀態變更"""
+        current_time = time.time()
+
+        # 更新健康指標
+        self.ws_health_metrics["total_attempts"] += 1
+
+        if state == WSConnectionState.CONNECTED:
+            self.ws_health_metrics["last_success_time"] = current_time
+            self.ws_health_metrics["success_count"] += 1
+            if self.ws_health_metrics["last_error_time"]:
+                downtime = current_time - self.ws_health_metrics["last_error_time"]
+                self.ws_health_metrics["connection_uptime"] += downtime
+
+            logger.info(
+                "WebSocket 連接成功建立",
+                event_type="websocket_connected",
+                data={
+                    "session_id": self.session_id,
+                    "total_attempts": self.ws_health_metrics["total_attempts"],
+                    "success_count": self.ws_health_metrics["success_count"],
+                    "circuit_breaker": self.ws_circuit_breaker.get_status()
+                }
+            )
+
+        elif state == WSConnectionState.DISCONNECTED:
+            logger.warning(
+                "WebSocket 連接斷開",
+                event_type="websocket_disconnected",
+                data={
+                    "session_id": self.session_id,
+                    "connection_duration": current_time - (self.ws_health_metrics.get("last_success_time") or current_time)
+                }
+            )
+
+        elif state == WSConnectionState.FAILED:
+            self.ws_health_metrics["last_error_time"] = current_time
+            self.ws_health_metrics["error_count"] += 1
+
+            logger.error(
+                "WebSocket 連接失敗",
+                event_type="websocket_connection_failed",
+                data={
+                    "session_id": self.session_id,
+                    "error_count": self.ws_health_metrics["error_count"],
+                    "success_rate": (
+                        self.ws_health_metrics["success_count"] / self.ws_health_metrics["total_attempts"] * 100
+                        if self.ws_health_metrics["total_attempts"] > 0 else 0
+                    ),
+                    "circuit_breaker": self.ws_circuit_breaker.get_status()
+                }
+            )
+
+    def _get_connection_health_status(self) -> Dict[str, Any]:
+        """獲取連接健康狀態總結"""
+        current_time = time.time()
+        total_attempts = self.ws_health_metrics["total_attempts"]
+
+        if total_attempts == 0:
+            return {
+                "status": "no_data",
+                "message": "尚未建立任何連接"
+            }
+
+        success_rate = (self.ws_health_metrics["success_count"] / total_attempts) * 100
+        last_success_ago = (
+            current_time - self.ws_health_metrics["last_success_time"]
+            if self.ws_health_metrics["last_success_time"] else None
+        )
+        last_error_ago = (
+            current_time - self.ws_health_metrics["last_error_time"]
+            if self.ws_health_metrics["last_error_time"] else None
+        )
+
+        # 計算健康等級
+        if success_rate >= 90:
+            health_level = "excellent"
+        elif success_rate >= 75:
+            health_level = "good"
+        elif success_rate >= 50:
+            health_level = "fair"
+        else:
+            health_level = "poor"
+
+        return {
+            "health_level": health_level,
+            "success_rate": round(success_rate, 2),
+            "total_attempts": total_attempts,
+            "success_count": self.ws_health_metrics["success_count"],
+            "error_count": self.ws_health_metrics["error_count"],
+            "broken_pipe_count": self.ws_health_metrics["broken_pipe_count"],
+            "auth_error_count": self.ws_health_metrics["auth_error_count"],
+            "last_success_ago_seconds": last_success_ago,
+            "last_error_ago_seconds": last_error_ago,
+            "circuit_breaker": self.ws_circuit_breaker.get_status(),
+            "session_id": self.session_id
+        }
+
+    def _safe_schedule_coroutine(self, coro, description: str = "coroutine"):
+        """線程安全地調度協程到主事件循環"""
+        if not self.main_loop:
+            logger.warning(f"無法調度 {description}：主事件循環不可用")
+            return None
+
+        try:
+            # 檢查事件循環是否仍在運行
+            if self.main_loop.is_closed():
+                logger.warning(f"無法調度 {description}：主事件循環已關閉")
+                return None
+
+            future = asyncio.run_coroutine_threadsafe(coro, self.main_loop)
+            return future
+
+        except RuntimeError as e:
+            logger.error(f"調度 {description} 失敗（運行時錯誤）: {e}")
+        except ValueError as e:
+            logger.error(f"調度 {description} 失敗（值錯誤）: {e}")
+        except Exception as e:
+            logger.error(f"調度 {description} 失敗（未知錯誤）: {e}")
+
+        return None
+
+    async def _threadsafe_update_ws_state(self, state: WSConnectionState):
+        """線程安全的 WebSocket 狀態更新"""
+        async with self._ws_state_lock:
+            await self._update_ws_state(state)
+
+    def _threadsafe_increment_metric(self, metric_name: str, increment: int = 1):
+        """線程安全地增加計數器"""
+        try:
+            if metric_name in self.ws_health_metrics:
+                self.ws_health_metrics[metric_name] += increment
+            else:
+                logger.warning(f"未知的健康指標: {metric_name}")
+        except Exception as e:
+            logger.error(f"更新健康指標 {metric_name} 失敗: {e}")
+
+    async def _validate_websocket_connection(self) -> bool:
+        """驗證 WebSocket 連接狀態"""
+        try:
+            # 檢查基本連接存在
+            if not self.wss_client:
+                logger.debug("WebSocket 客戶端不存在")
+                return False
+
+            # 檢查斷路器狀態
+            if not self.ws_circuit_breaker.can_execute():
+                logger.debug("Circuit breaker 阻止新連接")
+                return False
+
+            # 檢查 WebSocket 管理器中的連接狀態
+            if self.session_id:
+                ws_manager = get_websocket_manager()
+                connection_info = ws_manager.get_connection(self.session_id)
+
+                if not connection_info:
+                    logger.debug(f"會話 {self.session_id} 的連接信息不存在")
+                    return False
+
+                # 檢查連接狀態是否為已連接
+                if connection_info.state != WSConnectionState.CONNECTED:
+                    logger.debug(f"WebSocket 連接狀態不為已連接: {connection_info.state.value}")
+                    return False
+
+                # 檢查連接是否過於閒置（Docker 環境下使用更短的超時）
+                current_time = time.time()
+                last_activity = connection_info.last_activity
+                docker_timeout = min(self.DOCKER_CONNECTION_TIMEOUT, 300)  # 取較短的超時時間
+                if current_time - last_activity > docker_timeout:
+                    logger.warning(f"WebSocket 連接閒置過久（{docker_timeout}秒無活動），可能已斷開")
+                    return False
+
+            # 檢查客戶端是否仍有連接方法
+            if hasattr(self.wss_client, 'is_connected') and not self.wss_client.is_connected:
+                logger.debug("WebSocket 客戶端報告未連接")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"驗證 WebSocket 連接時發生錯誤: {e}")
+            return False
+
+    def _should_attempt_reconnection(self) -> bool:
+        """判斷是否應該嘗試重連"""
+        # 檢查基本運行狀態
+        if not self.is_running:
+            return False
+
+        if not self.ws_should_reconnect:
+            return False
+
+        # 檢查斷路器狀態
+        if not self.ws_circuit_breaker.can_execute():
+            logger.debug("Circuit breaker 阻止重連")
+            return False
+
+        # 檢查重連頻率限制
+        current_time = time.time()
+        if hasattr(self, '_last_reconnect_attempt'):
+            time_since_last = current_time - self._last_reconnect_attempt
+            if time_since_last < 30:  # 30秒內不重複重連
+                logger.debug(f"重連嘗試過於頻繁，距上次嘗試僅 {time_since_last:.1f} 秒")
+                return False
+
+        # 檢查健康指標
+        total_attempts = self.ws_health_metrics.get("total_attempts", 0)
+        if total_attempts > 0:
+            success_rate = (self.ws_health_metrics.get("success_count", 0) / total_attempts) * 100
+            if success_rate < 20:  # 成功率低於 20% 時謹慎重連
+                logger.warning(f"連接成功率過低 ({success_rate:.1f}%)，謹慎重連")
+                # 不完全阻止，但增加限制
+                if hasattr(self, '_last_reconnect_attempt'):
+                    time_since_last = current_time - self._last_reconnect_attempt
+                    if time_since_last < 120:  # 成功率低時增加到 2 分鐘間隔
+                        return False
+
+        return True
+
+    async def _start_health_monitoring(self):
+        """啟動連接健康監控"""
+        if self._health_monitor_task is None or self._health_monitor_task.done():
+            self._health_monitor_task = asyncio.create_task(self._health_monitor_loop())
+            logger.info("WebSocket 健康監控已啟動")
+
+    async def _stop_health_monitoring(self):
+        """停止連接健康監控"""
+        if self._health_monitor_task and not self._health_monitor_task.done():
+            self._health_monitor_task.cancel()
+            try:
+                await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("WebSocket 健康監控已停止")
+
+    async def _health_monitor_loop(self):
+        """健康監控循環"""
+        logger.info("WebSocket 健康監控循環已開始")
+
+        while self.is_running:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+                await self._perform_health_check()
+
+            except asyncio.CancelledError:
+                logger.info("健康監控循環被取消")
+                break
+            except Exception as e:
+                logger.error(f"健康監控循環發生錯誤: {e}")
+                # 繼續循環，不因單次錯誤而停止
+
+    async def _perform_health_check(self):
+        """執行健康檢查"""
+        try:
+            self._last_health_check = time.time()
+
+            # 檢查 WebSocket 連接狀態
+            connection_valid = await self._validate_websocket_connection()
+
+            # 獲取健康狀態
+            health_status = self._get_connection_health_status()
+
+            # 檢查連接時間是否過長
+            if self.session_id:
+                ws_manager = get_websocket_manager()
+                connection_info = ws_manager.get_connection(self.session_id)
+
+                if connection_info:
+                    current_time = time.time()
+                    connection_duration = current_time - connection_info.created_at
+
+                    # 如果連接持續時間超過 6 小時，主動重連
+                    if connection_duration > 6 * 3600:  # 6小時
+                        logger.info(
+                            "連接持續時間過長，主動重連",
+                            data={
+                                "connection_duration_hours": connection_duration / 3600,
+                                "reason": "preventive_reconnection"
+                            }
+                        )
+                        self._safe_schedule_coroutine(
+                            self._handle_ws_reconnect(),
+                            "預防性重連"
+                        )
+                        return
+
+            # 檢查是否需要發出警告
+            if not connection_valid:
+                logger.warning(
+                    "健康檢查發現連接問題",
+                    data={
+                        "health_status": health_status,
+                        "session_id": self.session_id
+                    },
+                    event_type="health_check_failed"
+                )
+
+                # 觸發重連（如果條件允許）
+                if self._should_attempt_reconnection():
+                    self._safe_schedule_coroutine(
+                        self._handle_ws_reconnect(),
+                        "健康檢查觸發重連"
+                    )
+
+            # 記錄健康檢查結果
+            else:
+                metrics.gauge("websocket.health_check_success", 1)
+                logger.debug(
+                    "健康檢查通過",
+                    data={
+                        "health_level": health_status.get("health_level"),
+                        "success_rate": health_status.get("success_rate", 0)
+                    }
+                )
+
+        except Exception as e:
+            logger.error(f"執行健康檢查時發生錯誤: {e}")
+            metrics.increment_counter("websocket.health_check.error")
+
+    def _get_health_monitor_status(self) -> Dict[str, Any]:
+        """獲取健康監控狀態"""
+        return {
+            "monitor_task_active": (
+                self._health_monitor_task is not None and
+                not self._health_monitor_task.done()
+            ),
+            "last_health_check": self._last_health_check,
+            "health_check_interval": self._health_check_interval,
+            "connection_health": self._get_connection_health_status()
+        }
+
     async def _handle_ws_reconnect(self):
         """
         處理 WebSocket 重連
-        這個方法會在 WebSocket 斷線時自動調用
+        這個方法會在 WebSocket 斷線時自動調用，集成斷路器模式和連接驗證
         """
         try:
-            logger.info("開始 WebSocket 重連流程")
-            
+            # 記錄重連嘗試時間
+            self._last_reconnect_attempt = time.time()
+
+            # 驗證是否應該重連
+            if not self._should_attempt_reconnection():
+                logger.debug("重連條件不滿足，跳過重連")
+                return
+
+            # 再次檢查斷路器狀態
+            if not self.ws_circuit_breaker.can_execute():
+                breaker_status = self.ws_circuit_breaker.get_status()
+                logger.warning(
+                    "Circuit breaker 阻止重連",
+                    data=breaker_status,
+                    event_type="circuit_breaker_blocking"
+                )
+                metrics.increment_counter("circuit_breaker.blocked")
+                return
+
+            # 檢查當前連接是否實際上仍然有效
+            current_connection_valid = await self._validate_websocket_connection()
+            if current_connection_valid:
+                logger.info("當前連接仍然有效，跳過重連")
+                metrics.increment_counter("websocket.reconnect.skipped")
+                return
+
+            logger.info(
+                "開始 WebSocket 重連流程",
+                data={
+                    "circuit_breaker_status": self.ws_circuit_breaker.get_status(),
+                    "connection_health": self._get_connection_health_status()
+                }
+            )
+
             # 關閉舊連接
             if self.wss_client:
                 try:
                     self._safe_close_ws()
                 except Exception as e:
                     logger.warning(f"關閉舊 WebSocket 連接時發生錯誤: {e}")
-            
+
             # 執行重連
             success = await self._reconnect_websocket()
-            
+
             if success:
                 logger.info("WebSocket 重連成功")
                 metrics.increment_counter("websocket.reconnect.success")
+                # 記錄成功到斷路器
+                self.ws_circuit_breaker.record_success()
+
+                # 驗證重連後的連接
+                post_reconnect_valid = await self._validate_websocket_connection()
+                if not post_reconnect_valid:
+                    logger.warning("重連成功但連接驗證失敗")
+                    self.ws_circuit_breaker.record_failure()
+                    metrics.increment_counter("websocket.reconnect.validation_failed")
+
             else:
                 logger.error("WebSocket 重連失敗，已達最大重試次數")
                 metrics.increment_counter("websocket.reconnect.failed")
-                
+                # 記錄失敗到斷路器
+                self.ws_circuit_breaker.record_failure()
+
                 # 可選：重連失敗後的處理
                 # 1. 繼續運行但不接收 WebSocket 消息
                 # 2. 停止網格交易
                 # 這裡選擇繼續運行（網格訂單仍然有效）
                 logger.warning("WebSocket 重連失敗，機器人將繼續運行但無法接收實時成交通知")
-                
+
         except Exception as e:
             logger.error(f"WebSocket 重連流程異常: {e}")
+            # 記錄異常到斷路器
+            self.ws_circuit_breaker.record_failure()
+            metrics.increment_counter("websocket.reconnect.exception")
 
     async def _reconnect_websocket(self, max_retries: int = None) -> bool:
         """
@@ -1678,6 +2231,10 @@ class GridTradingBot:
             # 啟動定期訂單同步任務
             self.order_sync_task = asyncio.create_task(self._periodic_order_sync())
             logger.info("定期訂單同步任務已啟動")
+
+            # 啟動 WebSocket 健康監控
+            await self._start_health_monitoring()
+            logger.info("WebSocket 健康監控已啟動")
             
             # 創建訊號生成器（⭐ 使用新的固定數量版本）
             self.signal_generator = GridSignalGenerator(
@@ -1748,6 +2305,13 @@ class GridTradingBot:
 
             # 清除引用
             self.ws_reconnect_task = None
+
+        # 停止 WebSocket 健康監控
+        try:
+            await self._stop_health_monitoring()
+        except Exception as e:
+            cleanup_errors.append(f"WebSocket 健康監控停止錯誤: {str(e)}")
+            logger.warning(f"停止 WebSocket 健康監控時發生錯誤: {e}")
 
         # 停止定期訂單同步任務
         if hasattr(self, 'order_sync_task') and self.order_sync_task:

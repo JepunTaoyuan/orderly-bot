@@ -6,7 +6,15 @@ FROM python:3.12-slim as base
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # WebSocket 稳定性优化
+    WEBSOCKET_PING_INTERVAL=30 \
+    WEBSOCKET_PING_TIMEOUT=10 \
+    WEBSOCKET_CLOSE_TIMEOUT=5 \
+    DOCKER_ENVIRONMENT=true \
+    # Python 优化
+    PYTHONASYNCIODEBUG=0 \
+    ASYNCIO_DEBUG=0
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
