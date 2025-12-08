@@ -95,6 +95,7 @@ grid_levels_below = grid_levels - grid_levels_above  （下方網格數）
 | 每格最小名義價值 | **11 USDT** | 交易所要求每筆訂單的名義價值（價格 × 數量）必須 ≥ 11 USDT |
 | 最小總保證金 | grid_levels × 11 USDT | 確保每格都能滿足最小名義價值要求 |
 
+(大致為11，各個ticker不同)
 #### 保證金分配計算
 
 **每格保證金 (margin_per_grid)**
@@ -380,4 +381,5 @@ flowchart TD
 ---
 
 *文件最後更新：2025-12-08*
+
 
