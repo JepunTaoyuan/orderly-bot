@@ -450,3 +450,20 @@ class MongoManager:
             logger.info(f"清理了 {deleted_count} 條過期的 nonce 記錄")
 
         return deleted_count
+
+    async def check_user_api_key_exist(self, user_id: str) -> bool:
+        """
+        檢查用戶API密鑰是否存在
+
+        Args:
+            user_id: 用戶ID
+
+        Returns:
+            是否存在API密鑰對
+        """
+        try:
+            user = await self.get_user(user_id)
+            return bool(user and user.get("api_key") and user.get("api_secret"))
+        except Exception as e:
+            logger.error(f"檢查用戶API密鑰是否存在失敗: {e}")
+            return False

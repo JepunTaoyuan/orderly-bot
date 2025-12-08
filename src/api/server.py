@@ -58,7 +58,29 @@ logger = get_logger("main")
 # 全域統一數據庫管理器
 db_manager = DatabaseManager()
 
-mongo_manager = None  # 聲明全域變數
+mongo_manager = None  # 聲明全域變數，僅用於 init_auth_dependencies
+
+async def get_current_mongo_manager():
+    """
+    安全獲取當前的 mongo_manager 實例
+
+    始終從 db_manager 獲取最新的 mongo_manager，確保在 MongoDB 健康監控
+    重建連接後仍能獲取有效的連接實例。
+
+    Returns:
+        MongoManager: 當前有效的 MongoManager 實例
+
+    Raises:
+        HTTPException: 如果數據庫未初始化
+    """
+    try:
+        return await db_manager.get_mongo_manager()
+    except RuntimeError as e:
+        logger.error(f"獲取 mongo_manager 失敗: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="數據庫服務不可用 - mongo_manager 未初始化"
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -278,18 +300,21 @@ class RegisterConfig(BaseModel):
 async def enable_bot_trading(request: Request, config: RegisterConfig):
     """啟用機器人交易 儲存用戶資料進database"""
     try:
+        # 獲取當前有效的 mongo_manager
+        current_mongo_manager = await get_current_mongo_manager()
+
         # 檢查用戶是否已存在
-        if not await mongo_manager.get_user(config.user_id):
+        if not await current_mongo_manager.get_user(config.user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": config.user_id}
             )
-        
+
         config.user_api_key = "ed25519:" + config.user_api_key
         config.user_api_secret = "ed25519:" + config.user_api_secret
 
         # 更新用戶API密鑰對
-        result = await mongo_manager.update_user_api_key_pair(
+        result = await current_mongo_manager.update_user_api_key_pair(
             config.user_id,
             config.user_api_key,
             config.user_api_secret,
@@ -322,15 +347,18 @@ async def enable_bot_trading(request: Request, config: RegisterConfig):
 async def check_user_api_key(request: Request, user_id: str):
     """檢查用戶API密鑰是否存在"""
     try:
+        # 獲取當前有效的 mongo_manager
+        current_mongo_manager = await get_current_mongo_manager()
+
         # 檢查用戶是否已存在
-        if not await mongo_manager.get_user(user_id):
+        if not await current_mongo_manager.get_user(user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": user_id}
-            )  
+            )
 
         # 檢查用戶API密鑰是否存在
-        api_key_exist = await mongo_manager.check_user_api_key_exist(user_id)
+        api_key_exist = await current_mongo_manager.check_user_api_key_exist(user_id)
         return {"success": True, "data": api_key_exist}
         
     except GridTradingException:
@@ -1099,8 +1127,11 @@ async def get_grid_summaries(request: Request, user_id: str, start_date: Optiona
         網格總結列表和統計信息
     """
     try:
+        # 獲取當前有效的 mongo_manager
+        current_mongo_manager = await get_current_mongo_manager()
+
         # 檢查用戶是否存在
-        if not await mongo_manager.get_user(user_id):
+        if not await current_mongo_manager.get_user(user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": user_id}
@@ -1211,8 +1242,11 @@ async def get_user_grid_statistics(request: Request, user_id: str):
         用戶網格交易統計信息
     """
     try:
+        # 獲取當前有效的 mongo_manager
+        current_mongo_manager = await get_current_mongo_manager()
+
         # 檢查用戶是否存在
-        if not await mongo_manager.get_user(user_id):
+        if not await current_mongo_manager.get_user(user_id):
             raise GridTradingException(
                 error_code=ErrorCode.USER_NOT_FOUND,
                 details={"user_id": user_id}

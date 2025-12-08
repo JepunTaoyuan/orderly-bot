@@ -12,6 +12,7 @@ import time
 from src.utils.retry_handler import RetryHandler, RetryConfig
 from src.utils.logging_config import get_logger
 from src.utils.api_helpers import with_orderly_api_handling
+from src.utils.rate_limit_protector import get_rate_limiter, RateLimitConfig
 
 # 使用結構化日誌
 logger = get_logger("orderly_client")
@@ -32,6 +33,15 @@ class OrderlyClient:
             base_delay=1.0,
             max_delay=30.0
         ))
+
+        # ⭐ 新增：速率限制保護器
+        rate_config = RateLimitConfig(
+            requests_per_minute=80,    # 降低到每分鐘80個請求
+            requests_per_second=8,     # 降低到每秒8個請求
+            safety_margin=0.7,         # 使用70%的安全邊界
+            enable_adaptive_throttling=True
+        )
+        self.rate_limiter = get_rate_limiter(f"client_{account_id}", rate_config)
 
         # ⭐ 新增：API速率限制監控
         self.api_rate_stats = {
@@ -529,17 +539,18 @@ class OrderlyClient:
     async def get_account_info(self) -> Dict[str, Any]:
         """
         獲取帳戶信息
-        
+
         Returns:
             帳戶信息
         """
         try:
-            # Use get_account_information() which doesn't require parameters
-            # get_account() requires address and broker_id which we don't have here
-            response = await self.client.get_account_information()
+            # ⭐ 優化：使用速率限制保護器
+            response = await self.rate_limiter.execute_with_protection(
+                self.client.get_account_information
+            )
             logger.info("獲取帳戶信息成功")
             return response
-            
+
         except Exception as e:
             logger.error(f"獲取帳戶信息失敗: {e}")
             raise
@@ -552,9 +563,11 @@ class OrderlyClient:
             持倉信息（標準化為 {'success': True, 'data': {'rows': [...]}} 結構）
         """
         try:
-            # 嘗試使用正確的 SDK 方法
+            # ⭐ 優化：使用速率限制保護器
             if hasattr(self.client, 'get_all_positions_info'):
-                raw = await self.client.get_all_positions_info()
+                raw = await self.rate_limiter.execute_with_protection(
+                    self.client.get_all_positions_info
+                )
             else:
                 # 如果沒有該方法，直接返回空持倉而不是拋出異常
                 logger.warning("SDK 缺少持倉相關方法，返回空持倉")

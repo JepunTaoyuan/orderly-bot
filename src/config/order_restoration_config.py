@@ -47,7 +47,7 @@ class OrderRestorationConfig:
     enable_time_window_check: bool = True  # 是否啟用時間窗口檢查
 
     # 同步設置
-    order_sync_interval_seconds: int = 60  # 訂單同步間隔
+    order_sync_interval_seconds: int = 120  # 訂單同步間隔（增加到2分鐘，降低API調用頻率）
 
     def __post_init__(self):
         """初始化後處理"""

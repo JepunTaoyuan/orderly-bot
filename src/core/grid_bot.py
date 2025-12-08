@@ -2334,10 +2334,17 @@ class GridTradingBot:
         # 停止信號生成器
         if self.signal_generator:
             try:
-                await self.signal_generator.stop_by_signal()
+                # ⭐ 修復：檢查 stop_by_signal 是否為異步方法
+                if asyncio.iscoroutinefunction(self.signal_generator.stop_by_signal):
+                    await self.signal_generator.stop_by_signal()
+                else:
+                    self.signal_generator.stop_by_signal()
+                logger.info("信號生成器已成功停止")
             except Exception as e:
                 cleanup_errors.append(f"信號生成器停止錯誤: {str(e)}")
                 logger.warning(f"停止信號生成器時發生錯誤: {e}")
+        else:
+            logger.debug("信號生成器不存在，跳過停止步驟")
 
         # 停止事件隊列
         if self.event_queue:
@@ -2518,14 +2525,54 @@ class GridTradingBot:
             self.signal_generator.get_status()
         
         try:
-            account_info = await self.client.get_account_info()
+            # ⭐ 優化：添加緩存機制，降低API調用頻率
+            current_time = time.time()
+            if not hasattr(self, '_account_info_cache'):
+                self._account_info_cache = {'data': None, 'timestamp': 0}
+                self._positions_cache = {'data': None, 'timestamp': 0}
+                self._cache_ttl = 30  # 緩存30秒
+
+            # 緩存帳戶信息（30秒內不重複獲取）
+            if (current_time - self._account_info_cache['timestamp'] > self._cache_ttl or
+                not self._account_info_cache['data']):
+                account_info = await self.client.get_account_info()
+                self._account_info_cache = {'data': account_info, 'timestamp': current_time}
+                logger.debug("帳戶信息已更新緩存")
+            else:
+                account_info = self._account_info_cache['data']
+                logger.debug("使用帳戶信息緩存")
+
             status["account_info"] = account_info
-            
-            positions = await self.client.get_positions()
+
+            # 緩存持倉信息（30秒內不重複獲取）
+            if (current_time - self._positions_cache['timestamp'] > self._cache_ttl or
+                not self._positions_cache['data']):
+                positions = await self.client.get_positions()
+                self._positions_cache = {'data': positions, 'timestamp': current_time}
+                logger.debug("持倉信息已更新緩存")
+            else:
+                positions = self._positions_cache['data']
+                logger.debug("使用持倉信息緩存")
+
             status["positions"] = positions
-            
+            status["cache_info"] = {
+                "account_info_cached": current_time - self._account_info_cache['timestamp'] < self._cache_ttl,
+                "positions_cached": current_time - self._positions_cache['timestamp'] < self._cache_ttl,
+                "cache_ttl": self._cache_ttl
+            }
+
         except Exception as e:
-            logger.error(f"獲取狀態失敗: {e}")
+            logger.error(f"獲取帳戶狀態失敗: {e}")
+            # 在錯誤情況下，嘗試返回緩存數據（即使過期）
+            if hasattr(self, '_account_info_cache') and self._account_info_cache['data']:
+                status["account_info"] = self._account_info_cache['data']
+                status["account_info_from_cache"] = True
+                logger.warning("使用過期的帳戶信息緩存作為備用")
+
+            if hasattr(self, '_positions_cache') and self._positions_cache['data']:
+                status["positions"] = self._positions_cache['data']
+                status["positions_from_cache"] = True
+                logger.warning("使用過期的持倉信息緩存作為備用")
         
         return status
 

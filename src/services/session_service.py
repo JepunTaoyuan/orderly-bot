@@ -19,6 +19,8 @@ from src.utils.error_codes import GridTradingException, ErrorCode
 from src.utils.session_cache import get_session_cache, SessionStateCache
 from src.utils.bot_pool import get_bot_pool, GridTradingBotPool
 from src.utils.api_batch_optimizer import get_api_optimizer, APIBatchOptimizer
+from src.utils.session_recovery_manager import SessionRecoveryManager
+from src.interfaces.session_manager_interface import SessionManagerInterface
 import os
 
 logger = get_logger("session_manager")
@@ -60,7 +62,7 @@ class SessionCreationLimiter:
         async with self._lock:
             self.current_creating.discard(session_id)
 
-class SessionManager:
+class SessionManager(SessionManagerInterface):
     def __init__(self):
         """初始化會話管理器"""
         self.sessions: Dict[str, GridTradingBot] = {}
@@ -104,6 +106,11 @@ class SessionManager:
         self.api_optimizer = await get_api_optimizer()
         await self.api_optimizer.start()
         logger.info("SessionManager API 優化器已啟動")
+
+        # 🚀 新增：初始化會話恢復管理器
+        self.recovery_manager = SessionRecoveryManager(self)
+        await self.recovery_manager.start_monitoring()
+        logger.info("SessionManager 恢復管理器已啟動")
     
     async def _validate_session_uniqueness(self, session_id: str, config: Dict[str, Any]) -> None:
         """
@@ -434,6 +441,42 @@ class SessionManager:
                     details={"session_id": session_id, "cleanup_error": str(cleanup_error)},
                     original_error=cleanup_error
                 )
+
+    async def restart_session(self, session_id: str) -> bool:
+        """
+        重啟交易會話
+
+        Args:
+            session_id: 會話ID
+
+        Returns:
+            是否重啟成功
+        """
+        # 先獲取會話配置以便重啟
+        async with self._sessions_lock:
+            if session_id not in self.sessions:
+                logger.warning(f"會話 {session_id} 不存在，無法重啟")
+                return False
+
+            bot = self.sessions[session_id]
+
+        try:
+            # 獲取會話配置
+            status = await bot.get_status()
+            config = status.get('config', {}) if status else {}
+
+            # 停止現有會話
+            await self.stop_session(session_id)
+
+            # 短暫等待確保完全停止
+            await asyncio.sleep(1)
+
+            # 重新創建會話
+            return await self.create_session(session_id, config)
+
+        except Exception as e:
+            logger.error(f"重啟會話 {session_id} 失敗: {e}")
+            return False
 
     async def _clear_session_cache(self, session_id: str):
         """
