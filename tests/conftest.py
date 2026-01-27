@@ -326,3 +326,210 @@ def mock_failed_api_response():
         "error_code": "E1000",
         "timestamp": 1234567890
     }
+
+
+# ============================================================================
+# Copy Trading Fixtures
+# ============================================================================
+
+@pytest.fixture
+def mock_copy_trading_websocket():
+    """Mock WebSocket client for Leader monitoring with execution reports."""
+    client = Mock()
+    client.get_execution_report = Mock()
+    client.get_position = Mock()
+    client.stop = Mock()
+    client.close = Mock()
+    client.on_message = None
+    client.on_error = None
+    client.on_close = None
+    client.is_connected = True
+    return client
+
+
+@pytest.fixture
+def sample_leader_trade_event():
+    """Sample leader trade event for testing."""
+    from datetime import datetime
+    from src.models.copy_trading import LeaderTradeEvent, CopyOrderSide, CopyOrderType, CopyTradeAction
+
+    return LeaderTradeEvent(
+        leader_id="leader_123",
+        order_id="order_456789",
+        symbol="PERP_BTC_USDC",
+        side=CopyOrderSide.BUY,
+        order_type=CopyOrderType.MARKET,
+        price=42500.0,
+        quantity=0.1,
+        action=CopyTradeAction.OPEN,
+        timestamp=datetime.utcnow(),
+        raw_data={"orderId": "order_456789", "status": "FILLED"}
+    )
+
+
+@pytest.fixture
+def sample_execution_report():
+    """Sample WebSocket execution report data."""
+    import time
+    return {
+        "topic": "executionreport",
+        "data": {
+            "orderId": "order_123456",
+            "symbol": "PERP_BTC_USDC",
+            "side": "BUY",
+            "type": "MARKET",
+            "status": "FILLED",
+            "executedPrice": 42500.50,
+            "executedQty": 0.1,
+            "avgPrice": 42500.50,
+            "timestamp": int(time.time() * 1000),
+            "reduceOnly": False
+        }
+    }
+
+
+@pytest.fixture
+def sample_follower_config():
+    """Sample follower configuration."""
+    return {
+        "follower_id": "follower_123",
+        "leader_id": "leader_456",
+        "copy_ratio": 1.0,
+        "orderly_key": "test_key_follower",
+        "orderly_secret": "test_secret_follower",
+        "orderly_testnet": True
+    }
+
+
+@pytest.fixture(params=[0.1, 1.0, 2.5, 10.0])
+def parametrized_copy_ratios(request):
+    """Test different copy ratios."""
+    return request.param
+
+
+@pytest.fixture
+def sample_risk_limits():
+    """Sample risk limits configuration."""
+    from src.models.copy_trading import RiskLimits
+
+    return RiskLimits(
+        max_per_trade_amount=1000.0,
+        daily_max_loss=500.0,
+        max_position_count=10,
+        max_position_value=10000.0,
+        max_single_position_ratio=0.3
+    )
+
+
+@pytest.fixture
+def strict_risk_limits():
+    """Strict risk limits for testing edge cases."""
+    from src.models.copy_trading import RiskLimits
+
+    return RiskLimits(
+        max_per_trade_amount=100.0,
+        daily_max_loss=50.0,
+        max_position_count=3,
+        max_position_value=1000.0,
+        max_single_position_ratio=0.2
+    )
+
+
+@pytest.fixture
+def sample_copy_trade_result():
+    """Sample copy trade execution result."""
+    from src.models.copy_trading import CopyTradeResult, CopyTradeStatus
+
+    return CopyTradeResult(
+        success=True,
+        follower_id="follower_123",
+        leader_order_id="leader_order_456",
+        follower_order_id="follower_order_789",
+        status=CopyTradeStatus.EXECUTED,
+        executed_price=42500.50,
+        executed_quantity=0.1,
+        latency_ms=150
+    )
+
+
+@pytest.fixture
+def sample_positions_data():
+    """Sample positions data from API."""
+    return {
+        "success": True,
+        "data": {
+            "rows": [
+                {
+                    "symbol": "PERP_BTC_USDC",
+                    "position_qty": "0.5",
+                    "average_open_price": "42000.0",
+                    "mark_price": "42500.0",
+                    "unsettled_pnl": "250.0"
+                },
+                {
+                    "symbol": "PERP_ETH_USDC",
+                    "position_qty": "-0.3",
+                    "average_open_price": "2800.0",
+                    "mark_price": "2750.0",
+                    "unsettled_pnl": "-50.0"
+                }
+            ]
+        }
+    }
+
+
+@pytest.fixture
+def mock_risk_controller():
+    """Mock RiskController for testing."""
+    from src.models.copy_trading import ValidationResult
+
+    controller = Mock()
+    controller.validate_trade = AsyncMock(return_value=ValidationResult(
+        is_valid=True,
+        reason="",
+        adjusted_quantity=None,
+        risk_score=0
+    ))
+    controller.record_trade_result = AsyncMock()
+    controller.sync_positions = AsyncMock()
+    controller.start = AsyncMock()
+    controller.stop = AsyncMock()
+    controller.get_risk_status = Mock(return_value={
+        "daily_loss": 0.0,
+        "position_count": 0,
+        "total_position_value": 0.0
+    })
+    return controller
+
+
+@pytest.fixture
+def mock_leader_monitor():
+    """Mock LeaderMonitor for testing."""
+    monitor = Mock()
+    monitor.start_monitoring = AsyncMock()
+    monitor.stop_monitoring = AsyncMock()
+    monitor.register_trade_callback = Mock()
+    monitor.is_monitoring = False
+    monitor.get_health_status = Mock(return_value={
+        "is_connected": True,
+        "trades_processed": 0,
+        "errors": 0
+    })
+    return monitor
+
+
+@pytest.fixture
+def mock_copy_trading_bot():
+    """Mock CopyTradingBot for testing."""
+    bot = Mock()
+    bot.start = AsyncMock()
+    bot.stop = AsyncMock()
+    bot.handle_leader_trade = AsyncMock()
+    bot.is_running = False
+    bot.get_status = Mock(return_value={
+        "is_running": False,
+        "trades_copied": 0,
+        "success_rate": 0.0
+    })
+    bot.get_trade_history = Mock(return_value=[])
+    return bot

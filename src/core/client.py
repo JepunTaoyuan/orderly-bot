@@ -626,7 +626,7 @@ class OrderlyClient:
         獲取訂單簿資料（為利潤與價格推估提供支援）
         """
         try:
-            response = await self.client.get_orderbook(symbol=symbol)
+            response = await self.client.get_orderbook_snapshot(symbol=symbol)
             logger.info("獲取訂單簿成功")
             return response
         except Exception as e:

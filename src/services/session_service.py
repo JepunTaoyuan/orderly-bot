@@ -16,6 +16,7 @@ from src.services.database_service import MongoManager
 from src.services.database_connection import db_manager
 from src.utils.logging_config import get_logger, metrics
 from src.utils.error_codes import GridTradingException, ErrorCode
+from src.models.copy_trading import TradingMode
 from src.utils.session_cache import get_session_cache, SessionStateCache
 from src.utils.bot_pool import get_bot_pool, GridTradingBotPool
 from src.utils.api_batch_optimizer import get_api_optimizer, APIBatchOptimizer
@@ -76,6 +77,10 @@ class SessionManager(SessionManagerInterface):
         self._creation_limiter = SessionCreationLimiter()
         # 🚀 優化：將在初始化後設置，以避免創建重複連接池
         self.mongo_manager = None
+
+        # 🆕 Copy Trading 互斥機制：追蹤每個用戶的交易模式
+        self._user_trading_modes: Dict[str, TradingMode] = {}
+        self._trading_mode_lock = asyncio.Lock()
 
         # 性能統計
         self.creation_metrics = {
@@ -241,6 +246,20 @@ class SessionManager(SessionManagerInterface):
             )
 
         try:
+            # 🆕 檢查交易模式衝突（Grid Trading vs Copy Trading 互斥）
+            user_id = config.get('user_id')
+            if user_id:
+                if await self.check_trading_mode_conflict(user_id, TradingMode.GRID):
+                    await self._creation_limiter.release(session_id)
+                    raise GridTradingException(
+                        error_code=ErrorCode.TRADING_MODE_CONFLICT,
+                        details={
+                            "user_id": user_id,
+                            "current_mode": (await self.get_user_trading_mode(user_id)).value if await self.get_user_trading_mode(user_id) else "unknown",
+                            "requested_mode": "grid"
+                        }
+                    )
+
             # 驗證會話唯一性
             await self._validate_session_uniqueness(session_id, config)
 
@@ -294,6 +313,9 @@ class SessionManager(SessionManagerInterface):
                 async with self._sessions_lock:
                     self.sessions[session_id] = bot
                     self._creating_sessions.discard(session_id)
+
+                # 🆕 註冊交易模式
+                await self.register_trading_mode(user_id, TradingMode.GRID)
 
                 # 記錄成功指標
                 self.creation_metrics['successful'] += 1
@@ -422,6 +444,18 @@ class SessionManager(SessionManagerInterface):
 
                 # 🚀 優化：清理相關緩存
                 await self._clear_session_cache(session_id)
+
+                # 🆕 檢查用戶是否還有其他 Grid Trading 會話，若無則取消交易模式註冊
+                user_id = session_id.split('_', 1)[0] if '_' in session_id else session_id
+                has_other_grid_sessions = False
+                for other_session_id in self.sessions:
+                    other_user_id = other_session_id.split('_', 1)[0] if '_' in other_session_id else other_session_id
+                    if other_user_id == user_id:
+                        has_other_grid_sessions = True
+                        break
+
+                if not has_other_grid_sessions:
+                    await self.unregister_trading_mode(user_id, TradingMode.GRID)
 
                 # 🚀 優化：將 bot 歸還到對象池
                 if hasattr(self, 'bot_pool') and stop_successful:
@@ -794,3 +828,108 @@ class SessionManager(SessionManagerInterface):
         logger.info(f"批量停止指定會話完成: {successful}/{len(session_ids)} 成功")
 
         return result_dict
+
+    # ============== Copy Trading 互斥機制方法 ==============
+
+    async def check_trading_mode_conflict(self, user_id: str, requested_mode: TradingMode) -> bool:
+        """
+        檢查用戶是否有交易模式衝突
+
+        Args:
+            user_id: 用戶ID
+            requested_mode: 請求的交易模式
+
+        Returns:
+            True 如果存在衝突，False 如果無衝突
+        """
+        async with self._trading_mode_lock:
+            if user_id not in self._user_trading_modes:
+                return False
+
+            current_mode = self._user_trading_modes[user_id]
+            has_conflict = current_mode != requested_mode
+
+            if has_conflict:
+                logger.warning(
+                    f"用戶 {user_id} 交易模式衝突: 當前模式 {current_mode.value}, 請求模式 {requested_mode.value}"
+                )
+
+            return has_conflict
+
+    async def register_trading_mode(self, user_id: str, mode: TradingMode) -> bool:
+        """
+        註冊用戶的交易模式
+
+        Args:
+            user_id: 用戶ID
+            mode: 交易模式
+
+        Returns:
+            True 如果註冊成功，False 如果存在衝突
+        """
+        async with self._trading_mode_lock:
+            # 檢查是否已有其他模式
+            if user_id in self._user_trading_modes:
+                current_mode = self._user_trading_modes[user_id]
+                if current_mode != mode:
+                    logger.warning(
+                        f"用戶 {user_id} 已在 {current_mode.value} 模式，無法切換到 {mode.value}"
+                    )
+                    return False
+                # 相同模式，視為成功
+                return True
+
+            self._user_trading_modes[user_id] = mode
+            logger.info(f"用戶 {user_id} 已註冊交易模式: {mode.value}")
+            return True
+
+    async def unregister_trading_mode(self, user_id: str, mode: Optional[TradingMode] = None) -> bool:
+        """
+        取消註冊用戶的交易模式
+
+        Args:
+            user_id: 用戶ID
+            mode: 可選，只有當前模式匹配時才取消註冊
+
+        Returns:
+            True 如果取消成功或用戶本來就沒有註冊
+        """
+        async with self._trading_mode_lock:
+            if user_id not in self._user_trading_modes:
+                return True
+
+            current_mode = self._user_trading_modes[user_id]
+
+            # 如果指定了模式，檢查是否匹配
+            if mode is not None and current_mode != mode:
+                logger.warning(
+                    f"用戶 {user_id} 當前模式 {current_mode.value} 與請求取消的模式 {mode.value} 不匹配"
+                )
+                return False
+
+            del self._user_trading_modes[user_id]
+            logger.info(f"用戶 {user_id} 已取消交易模式註冊: {current_mode.value}")
+            return True
+
+    async def get_user_trading_mode(self, user_id: str) -> Optional[TradingMode]:
+        """
+        獲取用戶當前的交易模式
+
+        Args:
+            user_id: 用戶ID
+
+        Returns:
+            用戶的交易模式，如果沒有則返回 None
+        """
+        async with self._trading_mode_lock:
+            return self._user_trading_modes.get(user_id)
+
+    async def get_all_trading_modes(self) -> Dict[str, TradingMode]:
+        """
+        獲取所有用戶的交易模式
+
+        Returns:
+            用戶ID到交易模式的映射
+        """
+        async with self._trading_mode_lock:
+            return dict(self._user_trading_modes)

@@ -1,4 +1,12 @@
 {
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "088ae4f0eee64f1fa599a4f22a26d880.rElkJFBMumYTPM0o",
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "API_TIMEOUT_MS": "3000000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7"
+  },
   "permissions": {
     "allow": [
       "Bash(tree:*)",
@@ -12,7 +20,10 @@
       "Bash(PYTHONPATH=/mnt/c/Users/user/Desktop/orderly_back/orderly_bot python:*)",
       "Bash(find:*)",
       "WebFetch(domain:orderly.network)",
-      "Bash(timeout 30 pytest:*)"
+      "Bash(timeout 30 pytest:*)",
+      "Skill(superpowers:brainstorming)",
+      "mcp__deepwiki__read_wiki_structure",
+      "Skill(brainstorming)"
     ],
     "deny": [],
     "ask": []

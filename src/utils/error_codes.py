@@ -80,6 +80,35 @@ class ErrorCode(Enum):
     # 斷路器錯誤 (8000-8999)
     CIRCUIT_BREAKER_OPEN = "E8000"
 
+    # Copy Trading 錯誤 (9000-9999)
+    COPY_TRADING_ERROR = "E9000"
+    LEADER_NOT_FOUND = "E9001"
+    LEADER_NOT_ACTIVE = "E9002"
+    ALREADY_FOLLOWING = "E9003"
+    NOT_FOLLOWING_ANYONE = "E9004"
+    LEADER_REGISTRATION_FAILED = "E9005"
+    FOLLOWER_REGISTRATION_FAILED = "E9006"
+    COPY_TRADE_FAILED = "E9007"
+    RISK_LIMIT_EXCEEDED = "E9008"
+    DAILY_LOSS_LIMIT_REACHED = "E9009"
+    POSITION_LIMIT_REACHED = "E9010"
+    TRADING_MODE_CONFLICT = "E9011"
+    SELF_FOLLOW_NOT_ALLOWED = "E9012"
+    LEADER_ALREADY_REGISTERED = "E9013"
+    LEADER_PENDING_APPROVAL = "E9014"
+    LEADER_REJECTED = "E9015"
+    LEADER_MONITOR_FAILED = "E9016"
+    COPY_RATIO_INVALID = "E9017"
+    FOLLOWER_NOT_FOUND = "E9018"
+    LEADER_ALREADY_PENDING = "E9019"
+    LEADER_MISSING_API_KEY = "E9020"
+    LEADER_MONITOR_START_FAILED = "E9021"
+    FOLLOWER_MISSING_API_KEY = "E9022"
+    FOLLOWER_ALREADY_FOLLOWING = "E9023"
+    INVALID_COPY_RATIO = "E9024"
+    FOLLOWER_START_FAILED = "E9025"
+    FOLLOWER_NOT_FOLLOWING = "E9026"
+
 
 @dataclass
 class ErrorDetail:
@@ -88,8 +117,7 @@ class ErrorDetail:
     message: str
     description: str
     http_status: int = 500
-    user_message: Optional[str] = None  # 用戶友好的錯誤訊息 (Chinese)
-    user_message_en: Optional[str] = None  # User-friendly error message (English)
+    user_message: Optional[str] = None  # User-friendly error message (English)
 
 
 # 錯誤碼對應的詳細信息
@@ -99,36 +127,31 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.UNKNOWN_ERROR,
         message="Unknown error occurred",
         description="An unexpected error occurred in the system",
-        http_status=500,
-        user_message="系統發生未知錯誤，請稍後重試"
+        http_status=500
     ),
     ErrorCode.INVALID_REQUEST: ErrorDetail(
         code=ErrorCode.INVALID_REQUEST,
         message="Invalid request format",
         description="The request format is invalid or malformed",
-        http_status=400,
-        user_message="請求格式不正確"
+        http_status=400
     ),
     ErrorCode.MISSING_PARAMETER: ErrorDetail(
         code=ErrorCode.MISSING_PARAMETER,
         message="Missing required parameter",
         description="One or more required parameters are missing",
-        http_status=400,
-        user_message="缺少必要參數"
+        http_status=400
     ),
     ErrorCode.INVALID_PARAMETER: ErrorDetail(
         code=ErrorCode.INVALID_PARAMETER,
         message="Invalid parameter value",
         description="One or more parameters have invalid values",
-        http_status=400,
-        user_message="參數值不正確"
+        http_status=400
     ),
     ErrorCode.INTERNAL_SERVER_ERROR: ErrorDetail(
         code=ErrorCode.INTERNAL_SERVER_ERROR,
         message="Internal server error",
         description="An internal server error occurred",
-        http_status=500,
-        user_message="伺服器內部錯誤，請稍後重試"
+        http_status=500
     ),
 
     # 認證錯誤
@@ -136,29 +159,25 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.UNAUTHORIZED,
         message="Unauthorized",
         description="Authentication is required",
-        http_status=401,
-        user_message="未經授權"
+        http_status=401
     ),
     ErrorCode.INVALID_CREDENTIALS: ErrorDetail(
         code=ErrorCode.INVALID_CREDENTIALS,
         message="Invalid credentials",
         description="The provided credentials are invalid",
-        http_status=401,
-        user_message="憑證無效"
+        http_status=401
     ),
     ErrorCode.TOKEN_EXPIRED: ErrorDetail(
         code=ErrorCode.TOKEN_EXPIRED,
         message="Token expired",
         description="The authentication token has expired",
-        http_status=401,
-        user_message="認證令牌已過期"
+        http_status=401
     ),
     ErrorCode.INVALID_SIGNATURE: ErrorDetail(
         code=ErrorCode.INVALID_SIGNATURE,
         message="Invalid signature",
         description="The signature verification failed",
-        http_status=401,
-        user_message="簽名驗證失敗"
+        http_status=401
     ),
 
     # 會話管理錯誤
@@ -166,51 +185,43 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.SESSION_NOT_FOUND,
         message="Session not found",
         description="The requested session does not exist",
-        http_status=404,
-        user_message="找不到指定的交易會話"
+        http_status=404
     ),
     ErrorCode.SESSION_ALREADY_EXISTS: ErrorDetail(
         code=ErrorCode.SESSION_ALREADY_EXISTS,
         message="Session already exists",
         description="A session with the same ID already exists",
-        http_status=409,
-        user_message="交易會話已存在"
+        http_status=409
     ),
     ErrorCode.SESSION_CREATE_FAILED: ErrorDetail(
         code=ErrorCode.SESSION_CREATE_FAILED,
         message="Failed to create session",
         description="Failed to create a new trading session",
-        http_status=500,
-        user_message="創建交易會話失敗"
+        http_status=500
     ),
     ErrorCode.SESSION_STOP_FAILED: ErrorDetail(
         code=ErrorCode.SESSION_STOP_FAILED,
         message="Failed to stop session",
         description="Failed to stop the trading session",
-        http_status=500,
-        user_message="停止交易會話失敗"
+        http_status=500
     ),
     ErrorCode.SESSION_CREATE_RATE_LIMITED: ErrorDetail(
         code=ErrorCode.SESSION_CREATE_RATE_LIMITED,
         message="Session creation rate limited",
         description="Too many sessions are being created simultaneously",
-        http_status=429,
-        user_message="請求過於頻繁，請稍後重試"
+        http_status=429
     ),
     ErrorCode.INVALID_SESSION_ID: ErrorDetail(
         code=ErrorCode.INVALID_SESSION_ID,
         message="Invalid session ID",
         description="The session ID format is invalid",
-        http_status=400,
-        user_message="會話ID格式不正確"
+        http_status=400
     ),
     ErrorCode.DUPLICATE_GRID_SESSION: ErrorDetail(
         code=ErrorCode.DUPLICATE_GRID_SESSION,
         message="Duplicate grid session",
         description="A grid session already exists for this ticker-account combination",
-        http_status=409,
-        user_message="該交易對和帳戶組合已存在活躍的網格會話",
-        user_message_en="An active grid session already exists for this trading pair and account combination"
+        http_status=409
     ),
     
     # 交易相關錯誤
@@ -218,29 +229,25 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.INVALID_SYMBOL,
         message="Invalid trading symbol",
         description="The specified trading symbol is not supported",
-        http_status=400,
-        user_message="不支援的交易對"
+        http_status=400
     ),
     ErrorCode.INVALID_PRICE: ErrorDetail(
         code=ErrorCode.INVALID_PRICE,
         message="Invalid price",
         description="The specified price is invalid or out of range",
-        http_status=400,
-        user_message="價格不正確"
+        http_status=400
     ),
     ErrorCode.INVALID_QUANTITY: ErrorDetail(
         code=ErrorCode.INVALID_QUANTITY,
         message="Invalid quantity",
         description="The specified quantity is invalid or out of range",
-        http_status=400,
-        user_message="數量不正確"
+        http_status=400
     ),
     ErrorCode.ORDER_CREATE_FAILED: ErrorDetail(
         code=ErrorCode.ORDER_CREATE_FAILED,
         message="Failed to create order",
         description="Failed to create the trading order",
-        http_status=500,
-        user_message="創建訂單失敗"
+        http_status=500
     ),
     
     # 網格配置錯誤
@@ -248,36 +255,31 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.INVALID_GRID_CONFIG,
         message="Invalid grid configuration",
         description="The grid trading configuration is invalid",
-        http_status=400,
-        user_message="網格配置不正確"
+        http_status=400
     ),
     ErrorCode.INVALID_PRICE_BOUNDS: ErrorDetail(
         code=ErrorCode.INVALID_PRICE_BOUNDS,
         message="Invalid price bounds",
         description="The upper and lower price bounds are invalid",
-        http_status=400,
-        user_message="價格邊界設定不正確"
+        http_status=400
     ),
     ErrorCode.INVALID_GRID_LEVELS: ErrorDetail(
         code=ErrorCode.INVALID_GRID_LEVELS,
         message="Invalid grid levels",
         description="The number of grid levels is invalid",
-        http_status=400,
-        user_message="網格層數設定不正確"
+        http_status=400
     ),
     ErrorCode.INVALID_TOTAL_AMOUNT: ErrorDetail(
         code=ErrorCode.INVALID_TOTAL_AMOUNT,
         message="Invalid total amount",
         description="The total investment amount is invalid",
-        http_status=400,
-        user_message="總投入金額不正確"
+        http_status=400
     ),
     ErrorCode.PRICE_OUT_OF_BOUNDS: ErrorDetail(
         code=ErrorCode.PRICE_OUT_OF_BOUNDS,
         message="Price out of bounds",
         description="The current price is outside the specified bounds",
-        http_status=400,
-        user_message="當前價格超出設定範圍"
+        http_status=400
     ),
     
     # 網格交易錯誤
@@ -285,33 +287,25 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.GRID_TRADING_ERROR,
         message="Grid trading error",
         description="An error occurred during grid trading operation",
-        http_status=500,
-        user_message="網格交易發生錯誤",
-        user_message_en="An error occurred during grid trading operation"
+        http_status=500
     ),
     ErrorCode.GRID_START_FAILED: ErrorDetail(
         code=ErrorCode.GRID_START_FAILED,
         message="Failed to start grid trading",
         description="Failed to start the grid trading session",
-        http_status=500,
-        user_message="啟動網格交易失敗",
-        user_message_en="Failed to start grid trading session"
+        http_status=500
     ),
     ErrorCode.GRID_STOP_FAILED: ErrorDetail(
         code=ErrorCode.GRID_STOP_FAILED,
         message="Failed to stop grid trading",
         description="Failed to stop the grid trading session",
-        http_status=500,
-        user_message="停止網格交易失敗",
-        user_message_en="Failed to stop grid trading session"
+        http_status=500
     ),
     ErrorCode.GRID_EXECUTION_ERROR: ErrorDetail(
         code=ErrorCode.GRID_EXECUTION_ERROR,
         message="Grid trading execution error",
         description="An error occurred during grid trading execution",
-        http_status=500,
-        user_message="網格交易執行發生錯誤",
-        user_message_en="An error occurred during grid trading execution"
+        http_status=500
     ),
 
     # 外部服務錯誤
@@ -319,22 +313,19 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.ORDERLY_API_ERROR,
         message="Orderly API error",
         description="An error occurred while calling Orderly API",
-        http_status=502,
-        user_message="交易所API錯誤"
+        http_status=502
     ),
     ErrorCode.ORDERLY_CONNECTION_ERROR: ErrorDetail(
         code=ErrorCode.ORDERLY_CONNECTION_ERROR,
         message="Orderly connection error",
         description="Failed to connect to Orderly API",
-        http_status=503,
-        user_message="無法連接到交易所"
+        http_status=503
     ),
     ErrorCode.ORDERLY_RATE_LIMIT: ErrorDetail(
         code=ErrorCode.ORDERLY_RATE_LIMIT,
         message="Orderly rate limit exceeded",
         description="Orderly API rate limit has been exceeded",
-        http_status=429,
-        user_message="請求過於頻繁，請稍後重試"
+        http_status=429
     ),
     
     # 用戶管理錯誤
@@ -342,29 +333,25 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.USER_ALREADY_EXISTS,
         message="User already exists",
         description="A user with the same ID already exists",
-        http_status=409,
-        user_message="用戶已存在"
+        http_status=409
     ),
     ErrorCode.USER_NOT_FOUND: ErrorDetail(
         code=ErrorCode.USER_NOT_FOUND,
         message="User not found",
         description="The requested user does not exist",
-        http_status=404,
-        user_message="找不到指定的用戶"
+        http_status=404
     ),
     ErrorCode.USER_CREATION_FAILED: ErrorDetail(
         code=ErrorCode.USER_CREATION_FAILED,
         message="Failed to create user",
         description="Failed to create a new user",
-        http_status=500,
-        user_message="創建用戶失敗"
+        http_status=500
     ),
     ErrorCode.USER_UPDATE_FAILED: ErrorDetail(
         code=ErrorCode.USER_UPDATE_FAILED,
         message="Failed to update user",
         description="Failed to update user information",
-        http_status=500,
-        user_message="更新用戶信息失敗"
+        http_status=500
     ),
 
     # 斷路器錯誤
@@ -372,44 +359,202 @@ ERROR_DETAILS: Dict[ErrorCode, ErrorDetail] = {
         code=ErrorCode.WEBSOCKET_CONNECTION_FAILED,
         message="WebSocket connection failed",
         description="Failed to establish WebSocket connection",
-        http_status=503,
-        user_message="WebSocket 連接失敗"
+        http_status=503
     ),
     ErrorCode.WEBSOCKET_CONNECTION_LIMIT_EXCEEDED: ErrorDetail(
         code=ErrorCode.WEBSOCKET_CONNECTION_LIMIT_EXCEEDED,
         message="WebSocket connection limit exceeded",
         description="Too many WebSocket connections are open",
-        http_status=429,
-        user_message="WebSocket 連接數過多，請稍後重試"
+        http_status=429
     ),
     ErrorCode.WEBSOCKET_RECONNECT_FAILED: ErrorDetail(
         code=ErrorCode.WEBSOCKET_RECONNECT_FAILED,
         message="WebSocket reconnection failed",
         description="Failed to reconnect WebSocket after disconnection",
-        http_status=503,
-        user_message="WebSocket 重連失敗"
+        http_status=503
     ),
 
     ErrorCode.CIRCUIT_BREAKER_OPEN: ErrorDetail(
         code=ErrorCode.CIRCUIT_BREAKER_OPEN,
         message="Circuit breaker is open",
         description="The service is temporarily unavailable due to repeated failures",
-        http_status=503,
-        user_message="服務暫時不可用，請稍後重試"
+        http_status=503
     ),
     ErrorCode.USER_API_KEY_PAIR_NOT_FOUND: ErrorDetail(
         code=ErrorCode.USER_API_KEY_PAIR_NOT_FOUND,
         message="User API key pair not found",
         description="The requested API key pair does not exist",
-        http_status=404,
-        user_message="找不到指定的用戶API密鑰對"
+        http_status=404
     ),
     ErrorCode.USER_API_KEY_PAIR_CHECK_FAILED: ErrorDetail(
         code=ErrorCode.USER_API_KEY_PAIR_CHECK_FAILED,
         message="Failed to check user API key pair",
         description="Failed to verify the API key pair for the user",
-        http_status=500,
-        user_message="檢查用戶API密鑰失敗"
+        http_status=500
+    ),
+
+    # Copy Trading 錯誤
+    ErrorCode.COPY_TRADING_ERROR: ErrorDetail(
+        code=ErrorCode.COPY_TRADING_ERROR,
+        message="Copy trading error",
+        description="An error occurred during copy trading operation",
+        http_status=500
+    ),
+    ErrorCode.LEADER_NOT_FOUND: ErrorDetail(
+        code=ErrorCode.LEADER_NOT_FOUND,
+        message="Leader not found",
+        description="The specified leader does not exist or is not registered",
+        http_status=404
+    ),
+    ErrorCode.LEADER_NOT_ACTIVE: ErrorDetail(
+        code=ErrorCode.LEADER_NOT_ACTIVE,
+        message="Leader not active",
+        description="The specified leader is not currently accepting followers",
+        http_status=400
+    ),
+    ErrorCode.ALREADY_FOLLOWING: ErrorDetail(
+        code=ErrorCode.ALREADY_FOLLOWING,
+        message="Already following a leader",
+        description="You are already following a leader. Stop following first to follow someone else",
+        http_status=409
+    ),
+    ErrorCode.NOT_FOLLOWING_ANYONE: ErrorDetail(
+        code=ErrorCode.NOT_FOLLOWING_ANYONE,
+        message="Not following anyone",
+        description="You are not currently following any leader",
+        http_status=400
+    ),
+    ErrorCode.LEADER_REGISTRATION_FAILED: ErrorDetail(
+        code=ErrorCode.LEADER_REGISTRATION_FAILED,
+        message="Leader registration failed",
+        description="Failed to register as a leader",
+        http_status=500
+    ),
+    ErrorCode.FOLLOWER_REGISTRATION_FAILED: ErrorDetail(
+        code=ErrorCode.FOLLOWER_REGISTRATION_FAILED,
+        message="Follower registration failed",
+        description="Failed to register as a follower",
+        http_status=500
+    ),
+    ErrorCode.COPY_TRADE_FAILED: ErrorDetail(
+        code=ErrorCode.COPY_TRADE_FAILED,
+        message="Copy trade execution failed",
+        description="Failed to execute the copy trade",
+        http_status=500
+    ),
+    ErrorCode.RISK_LIMIT_EXCEEDED: ErrorDetail(
+        code=ErrorCode.RISK_LIMIT_EXCEEDED,
+        message="Risk limit exceeded",
+        description="The trade exceeds your configured risk limits",
+        http_status=400
+    ),
+    ErrorCode.DAILY_LOSS_LIMIT_REACHED: ErrorDetail(
+        code=ErrorCode.DAILY_LOSS_LIMIT_REACHED,
+        message="Daily loss limit reached",
+        description="You have reached your daily maximum loss limit",
+        http_status=400
+    ),
+    ErrorCode.POSITION_LIMIT_REACHED: ErrorDetail(
+        code=ErrorCode.POSITION_LIMIT_REACHED,
+        message="Position limit reached",
+        description="You have reached your maximum position limit",
+        http_status=400
+    ),
+    ErrorCode.TRADING_MODE_CONFLICT: ErrorDetail(
+        code=ErrorCode.TRADING_MODE_CONFLICT,
+        message="Trading mode conflict",
+        description="You already have an active session in a different trading mode",
+        http_status=409
+    ),
+    ErrorCode.SELF_FOLLOW_NOT_ALLOWED: ErrorDetail(
+        code=ErrorCode.SELF_FOLLOW_NOT_ALLOWED,
+        message="Cannot follow yourself",
+        description="You cannot follow your own account",
+        http_status=400
+    ),
+    ErrorCode.LEADER_ALREADY_REGISTERED: ErrorDetail(
+        code=ErrorCode.LEADER_ALREADY_REGISTERED,
+        message="Already registered as leader",
+        description="You are already registered as a leader",
+        http_status=409
+    ),
+    ErrorCode.LEADER_PENDING_APPROVAL: ErrorDetail(
+        code=ErrorCode.LEADER_PENDING_APPROVAL,
+        message="Leader application pending",
+        description="Your leader application is pending approval",
+        http_status=400
+    ),
+    ErrorCode.LEADER_REJECTED: ErrorDetail(
+        code=ErrorCode.LEADER_REJECTED,
+        message="Leader application rejected",
+        description="Your leader application was rejected",
+        http_status=400
+    ),
+    ErrorCode.LEADER_MONITOR_FAILED: ErrorDetail(
+        code=ErrorCode.LEADER_MONITOR_FAILED,
+        message="Leader monitor failed",
+        description="Failed to start monitoring the leader's trades",
+        http_status=500
+    ),
+    ErrorCode.COPY_RATIO_INVALID: ErrorDetail(
+        code=ErrorCode.COPY_RATIO_INVALID,
+        message="Invalid copy ratio",
+        description="The copy ratio must be between 0.1 and 10.0",
+        http_status=400
+    ),
+    ErrorCode.FOLLOWER_NOT_FOUND: ErrorDetail(
+        code=ErrorCode.FOLLOWER_NOT_FOUND,
+        message="Follower not found",
+        description="The specified follower does not exist",
+        http_status=404
+    ),
+    ErrorCode.LEADER_ALREADY_PENDING: ErrorDetail(
+        code=ErrorCode.LEADER_ALREADY_PENDING,
+        message="Leader application already pending",
+        description="A leader application is already pending for this user",
+        http_status=409
+    ),
+    ErrorCode.LEADER_MISSING_API_KEY: ErrorDetail(
+        code=ErrorCode.LEADER_MISSING_API_KEY,
+        message="Leader missing API key",
+        description="Leader must have API credentials configured before applying",
+        http_status=400
+    ),
+    ErrorCode.LEADER_MONITOR_START_FAILED: ErrorDetail(
+        code=ErrorCode.LEADER_MONITOR_START_FAILED,
+        message="Leader monitor start failed",
+        description="Failed to start monitoring the leader's trading activity",
+        http_status=500
+    ),
+    ErrorCode.FOLLOWER_MISSING_API_KEY: ErrorDetail(
+        code=ErrorCode.FOLLOWER_MISSING_API_KEY,
+        message="Follower missing API key",
+        description="Follower must have API credentials configured before starting copy trading",
+        http_status=400
+    ),
+    ErrorCode.FOLLOWER_ALREADY_FOLLOWING: ErrorDetail(
+        code=ErrorCode.FOLLOWER_ALREADY_FOLLOWING,
+        message="Follower already following",
+        description="This user is already following a leader",
+        http_status=409
+    ),
+    ErrorCode.INVALID_COPY_RATIO: ErrorDetail(
+        code=ErrorCode.INVALID_COPY_RATIO,
+        message="Invalid copy ratio",
+        description="Copy ratio must be between 0.1 and 10.0",
+        http_status=400
+    ),
+    ErrorCode.FOLLOWER_START_FAILED: ErrorDetail(
+        code=ErrorCode.FOLLOWER_START_FAILED,
+        message="Follower start failed",
+        description="Failed to start copy trading for the follower",
+        http_status=500
+    ),
+    ErrorCode.FOLLOWER_NOT_FOLLOWING: ErrorDetail(
+        code=ErrorCode.FOLLOWER_NOT_FOLLOWING,
+        message="Follower not following",
+        description="This user is not currently following any leader",
+        http_status=400
     ),
 }
 

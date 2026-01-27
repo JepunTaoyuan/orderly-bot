@@ -47,6 +47,8 @@ from src.utils.error_recovery import start_error_recovery, stop_error_recovery, 
 from src.utils.mongodb_health import start_mongodb_health_monitoring, stop_mongodb_health_monitoring
 from src.models.grid_summary import GridSummaryFilter
 from src.services.grid_summary_service import GridSummaryService
+from src.services.copy_trading_service import get_copy_trading_manager
+from src.api.copy_trading_routes import router as copy_trading_router
 
 
 load_dotenv()
@@ -125,6 +127,11 @@ async def lifespan(app: FastAPI):
         await session_manager.initialize()
         logger.info("SessionManager 已使用統一數據庫連接池初始化")
 
+        # 🆕 初始化 CopyTradingSessionManager
+        copy_trading_manager = await get_copy_trading_manager()
+        await copy_trading_manager.initialize(session_manager)
+        logger.info("CopyTradingSessionManager 已初始化")
+
         # 記錄速率限制配置
         logger.info("速率限制配置", data={
             "global_limit": RATE_LIMITS['global'],
@@ -145,6 +152,14 @@ async def lifespan(app: FastAPI):
 
     # 應用關閉時的清理
     logger.info("應用正在關閉，執行清理操作...")
+
+    # 🆕 停止 CopyTradingSessionManager
+    try:
+        copy_trading_manager = await get_copy_trading_manager()
+        await copy_trading_manager.shutdown()
+        logger.info("CopyTradingSessionManager 已停止")
+    except Exception as e:
+        logger.error(f"停止 CopyTradingSessionManager 失敗: {e}")
 
     # 停止系統監控器
     try:
@@ -221,6 +236,9 @@ app.add_middleware(
 
 # 全域會話管理器
 session_manager = SessionManager()
+
+# 🆕 註冊 Copy Trading 路由
+app.include_router(copy_trading_router)
 
 # 全域異常處理器
 @app.exception_handler(GridTradingException)
