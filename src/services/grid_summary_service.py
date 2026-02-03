@@ -258,6 +258,7 @@ class GridSummaryService:
             await self.collection.create_index("end_time")
             await self.collection.create_index([("user_id", 1), ("end_time", -1)])
             await self.collection.create_index("stop_reason")
+            await self.collection.create_index("sub_account_id")
 
             logger.info("網格總結集合索引創建完成")
 

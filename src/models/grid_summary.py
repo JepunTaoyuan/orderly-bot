@@ -57,6 +57,7 @@ class GridSummary(BaseModel):
     start_time: datetime = Field(..., description="網格開始時間")
     end_time: datetime = Field(..., description="網格結束時間")
     duration_seconds: int = Field(..., description="運行時長（秒）")
+    sub_account_id: Optional[str] = Field(None, description="關聯的子帳戶ID")
 
     # 盈虧相關
     total_profit: float = Field(..., description="總盈虧")
@@ -117,7 +118,9 @@ class GridSummary(BaseModel):
             unpaired_profit=profit_data.get("unpaired_profit", 0.0),
             arbitrage_times=profit_data.get("arbitrage_times", 0),
             stop_reason=stop_reason,
+            stop_reason=stop_reason,
             grid_config=grid_config,
+            sub_account_id=grid_config.get("sub_account_id") or grid_config.get("orderly_account_id"),
             max_drawdown=kwargs.get("max_drawdown"),
             capital_utilization=kwargs.get("capital_utilization")
         )

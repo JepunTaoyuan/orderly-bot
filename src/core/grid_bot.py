@@ -2160,6 +2160,33 @@ class GridTradingBot:
                 logger.error("配置驗證失敗", event_type="config_validation_error", data={"error": str(e)})
                 raise
             
+            # -------------------------------------------------------------
+            # 🆕 原生子帳戶集成 (Native Sub-Account Integration)
+            # -------------------------------------------------------------
+            # 檢查是否需要更新客戶端以使用子帳戶 ID
+            if 'orderly_account_id' in config:
+                new_account_id = config['orderly_account_id']
+                # 如果配置中的 ID 與當前客戶端的 ID 不同，重新初始化客戶端
+                # 注意：我們假設 OrderlyClient 的內部 client 有 orderly_account_id 屬性，或者我們需要檢查構造函數參數
+                if hasattr(self.client.client, 'orderly_account_id') and self.client.client.orderly_account_id != new_account_id:
+                     logger.info(f"切換 GridTradingBot 客戶端至子帳戶: {new_account_id}", event_type="sub_account_switch")
+                     self.client = OrderlyClient(
+                         account_id=new_account_id,
+                         orderly_key=config['orderly_key'],
+                         orderly_secret=config['orderly_secret'],
+                         orderly_testnet=config.get('orderly_testnet', True)
+                     )
+                elif not hasattr(self.client.client, 'orderly_account_id'):
+                    # 如果無法直接檢查，強制更新以確保正確
+                    logger.info(f"重新初始化 GridTradingBot 客戶端 (子帳戶): {new_account_id}", event_type="sub_account_switch_forced")
+                    self.client = OrderlyClient(
+                         account_id=new_account_id,
+                         orderly_key=config['orderly_key'],
+                         orderly_secret=config['orderly_secret'],
+                         orderly_testnet=config.get('orderly_testnet', True)
+                     )
+            # -------------------------------------------------------------
+            
             # ⭐ 新增：初始化利潤追蹤器
             self.profit_tracker = ProfitTracker(
                 symbol=config['_orderly_symbol'],

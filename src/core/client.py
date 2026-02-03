@@ -678,3 +678,73 @@ class OrderlyClient:
         except Exception as e:
             logger.error(f"平倉失敗: {e}")
             raise
+        """
+        新增子帳戶
+        
+        Args:
+            description: 子帳戶描述
+            
+        Returns:
+            創建結果，包含 sub_account_id
+        """
+        try:
+            logger.info(f"新增子帳戶，描述: {description}")
+            response = await self.client.add_sub_account(description=description)
+            logger.info(f"新增子帳戶成功: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"新增子帳戶失敗: {e}")
+            raise
+
+    async def get_sub_account(self) -> Dict[str, Any]:
+        """
+        獲取子帳戶列表
+        
+        Returns:
+            子帳戶列表
+        """
+        try:
+            response = await self.client.get_sub_account()
+            logger.info("獲取子帳戶列表成功")
+            return response
+        except Exception as e:
+            logger.error(f"獲取子帳戶列表失敗: {e}")
+            raise
+
+    async def internal_transfer(self, token: str, receiver_list: list) -> Dict[str, Any]:
+        """
+        內部轉帳
+        
+        Args:
+            token: 代幣符號 (如 'USDC')
+            receiver_list: 接收列表 [{"account_id": "...", "amount": 100}]
+            
+        Returns:
+            轉帳結果
+        """
+        try:
+            logger.info(f"內部轉帳: {token}, 接收者: {len(receiver_list)} 個")
+            response = await self.client.internal_transfer(token=token, receiver_list=receiver_list)
+            logger.info(f"內部轉帳成功: {response}")
+            # 等待一小段時間讓轉帳生效
+            await asyncio.sleep(1.0)
+            return response
+        except Exception as e:
+            logger.error(f"內部轉帳失敗: {e}")
+            raise
+
+    async def get_aggregate_holding(self) -> Dict[str, Any]:
+        """
+        獲取所有子帳戶的聚合持倉
+        
+        Returns:
+            聚合持倉信息
+        """
+        try:
+            response = await self.client.get_aggregate_holding()
+            logger.info("獲取聚合持倉成功")
+            return response
+        except Exception as e:
+            logger.error(f"獲取聚合持倉失敗: {e}")
+            raise
+

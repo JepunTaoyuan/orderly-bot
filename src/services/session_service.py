@@ -291,16 +291,89 @@ class SessionManager(SessionManagerInterface):
 
                 # 🚀 優化：從對象池獲取 GridTradingBot 實例
                 wallet_address = user_data.get('wallet_address') or user_data.get('evm_wallet_address')
+                
+                # -------------------------------------------------------------
+                # 🆕 原生子帳戶集成 (Native Sub-Account Integration)
+                # -------------------------------------------------------------
+                # 當前策略：為每個網格會話創建一個獨立的子帳戶以隔離資金
+                
+                # 1. 初始化臨時客戶端（使用主帳戶身份）
+                from src.core.client import OrderlyClient
+                main_account_id = user_id
+                temp_client = OrderlyClient(
+                    account_id=main_account_id,
+                    orderly_key=user_data.get('api_key'),
+                    orderly_secret=user_data.get('api_secret'),
+                    orderly_testnet=True # 假設默認使用測試網，需確認環境配置
+                )
+                
+                sub_account_id = config.get('sub_account_id')
+                initial_investment = float(config.get('initial_investment', 0))
+                
+                # 2. 如果沒有提供子帳戶，則創建一個新的
+                if not sub_account_id:
+                    try:
+                        logger.info(f"為會話 {session_id} 創建新的子帳戶...")
+                        sub_acc_desc = f"Grid_{session_id}"[:30] # 描述長度可能有限制
+                        sub_acc_res = await temp_client.add_sub_account(description=sub_acc_desc)
+                        
+                        if sub_acc_res and sub_acc_res.get('success'):
+                            sub_account_id = sub_acc_res['data']['sub_account_id']
+                            logger.info(f"子帳戶創建成功: {sub_account_id}")
+                            
+                            # 保存子帳戶ID到配置，以便後續使用和恢復
+                            config['sub_account_id'] = sub_account_id
+                        else:
+                            raise GridTradingException(
+                                error_code=ErrorCode.API_ERROR,
+                                details={"message": "無法創建子帳戶", "response": sub_acc_res}
+                            )
+                    except Exception as e:
+                        logger.error(f"創建子帳戶失敗: {e}")
+                        raise
+                
+                # 3. 資金劃轉：從主帳戶 -> 子帳戶
+                if initial_investment > 0:
+                    try:
+                        logger.info(f"正在將 {initial_investment} USDC 劃轉至子帳戶 {sub_account_id}...")
+                        transfer_res = await temp_client.internal_transfer(
+                            token="USDC",
+                            receiver_list=[{
+                                "account_id": sub_account_id,
+                                "amount": initial_investment
+                            }]
+                        )
+                        
+                        if not transfer_res or not transfer_res.get('success'):
+                            raise GridTradingException(
+                                error_code=ErrorCode.INSUFFICIENT_BALANCE,
+                                details={"message": "資金劃轉失敗", "response": transfer_res}
+                            )
+                            
+                        logger.info("資金劃轉成功，等待餘額更新...")
+                        # 稍微等待餘額更新
+                        await asyncio.sleep(2.0)
+                        
+                    except Exception as e:
+                        logger.error(f"資金劃轉失敗: {e}")
+                        raise
+                
+                # -------------------------------------------------------------
+                
+                # 這裡我們初始化 Bot 時，傳入的是主帳戶的 Key，但在增強配置中指定 sub_account_id
+                # Bot 內部的 Client 初始化會使用 config 中的 orderly_account_id
                 bot = await self.bot_pool.get_bot(
-                    account_id=user_id,
+                    account_id=main_account_id, # Bot Pool 緩存鍵仍使用主帳戶 ID
                     orderly_key=user_data.get('api_key'),
                     orderly_secret=user_data.get('api_secret')
                 )
 
                 # 將用戶憑證添加到配置中，供 GridTradingBot 使用
+                # 關鍵修改：將 orderly_account_id 設置為 sub_account_id
                 enhanced_config = config.copy()
                 enhanced_config.update({
-                    'orderly_account_id': user_id,
+                    'orderly_account_id': sub_account_id,  # ⭐ 使用子帳戶 ID
+                    'main_account_id': main_account_id,    # 保留主帳戶 ID 備查
                     'orderly_key': user_data.get('api_key'),
                     'orderly_secret': user_data.get('api_secret'),
                     'orderly_testnet': True
