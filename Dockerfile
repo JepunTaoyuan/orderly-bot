@@ -59,6 +59,9 @@ COPY --from=dependencies /usr/local/bin /usr/local/bin
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsodium23 \
     curl \
+    ca-certificates \
+    procps \
+    iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy application code
