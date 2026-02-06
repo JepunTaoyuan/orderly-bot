@@ -118,7 +118,7 @@ class GridSummary(BaseModel):
             unpaired_profit=profit_data.get("unpaired_profit", 0.0),
             arbitrage_times=profit_data.get("arbitrage_times", 0),
             stop_reason=stop_reason,
-            stop_reason=stop_reason,
+
             grid_config=grid_config,
             sub_account_id=grid_config.get("sub_account_id") or grid_config.get("orderly_account_id"),
             max_drawdown=kwargs.get("max_drawdown"),

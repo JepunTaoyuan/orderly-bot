@@ -128,9 +128,9 @@ async def lifespan(app: FastAPI):
         logger.info("SessionManager 已使用統一數據庫連接池初始化")
 
         # 🆕 初始化 CopyTradingSessionManager
-        copy_trading_manager = await get_copy_trading_manager()
-        await copy_trading_manager.initialize(session_manager)
-        logger.info("CopyTradingSessionManager 已初始化")
+        # copy_trading_manager = await get_copy_trading_manager()
+        # await copy_trading_manager.initialize(session_manager)
+        # logger.info("CopyTradingSessionManager 已初始化")
 
         # 記錄速率限制配置
         logger.info("速率限制配置", data={

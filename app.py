@@ -14,13 +14,15 @@ def main():
     print("📊 Orderly 網格交易 MVP 系統")
     print("=" * 50)
     
+    debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    
     # 啟動 FastAPI 服務器
     uvicorn.run(
         "src.api.server:app",  # 使用字符串導入以支持 reload
         host=os.getenv("UVICORN_HOST", "0.0.0.0"),
         port=int(os.getenv("UVICORN_PORT", "8001")),
-        workers=1 if os.getenv("DEBUG", "false").lower() == "true" else 4,
-        reload=True,
+        workers=1 if debug_mode else 4,
+        reload=debug_mode,
         log_level="info"
     )
 
