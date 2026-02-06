@@ -55,6 +55,12 @@ WORKDIR /app
 COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsodium23 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy application code
 COPY --chown=appuser:appuser . .
 
