@@ -98,7 +98,7 @@ class TestMongoManager:
             mock_result = Mock()
             mock_result.inserted_id = "test_user_123"
 
-            mock_collection.insert_one.return_value = mock_result
+            mock_collection.insert_one = AsyncMock(return_value=mock_result)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -133,7 +133,7 @@ class TestMongoManager:
             mock_result = Mock()
             mock_result.inserted_id = "test_user_123"
 
-            mock_collection.insert_one.return_value = mock_result
+            mock_collection.insert_one = AsyncMock(return_value=mock_result)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -170,7 +170,7 @@ class TestMongoManager:
                 "wallet_address": "0x1234567890123456789012345678901234567890"
             }
 
-            mock_collection.find_one.return_value = mock_user_data
+            mock_collection.find_one = AsyncMock(return_value=mock_user_data)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -190,7 +190,7 @@ class TestMongoManager:
             mock_database = Mock()
             mock_collection = Mock()
 
-            mock_collection.find_one.return_value = None
+            mock_collection.find_one = AsyncMock(return_value=None)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -200,7 +200,10 @@ class TestMongoManager:
             result = await manager.get_user("non_existing_user")
 
             assert result is None
-            mock_collection.find_one.assert_called_once_with({"user_id": "non_existing_user"})
+            assert mock_collection.find_one.await_count == 3
+            assert mock_collection.find_one.await_args_list[0].args[0] == {"user_id": "non_existing_user"}
+            assert mock_collection.find_one.await_args_list[1].args[0] == {"_id": "non_existing_user"}
+            assert mock_collection.find_one.await_args_list[2].args[0] == {"wallet_address": "non_existing_user"}
 
     @pytest.mark.asyncio
     async def test_update_user(self, mock_mongo_uri):
@@ -213,7 +216,7 @@ class TestMongoManager:
             mock_result.matched_count = 1
             mock_result.modified_count = 1
 
-            mock_collection.update_one.return_value = mock_result
+            mock_collection.update_one = AsyncMock(return_value=mock_result)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -244,7 +247,7 @@ class TestMongoManager:
             mock_result.matched_count = 0
             mock_result.modified_count = 0
 
-            mock_collection.update_one.return_value = mock_result
+            mock_collection.update_one = AsyncMock(return_value=mock_result)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -268,7 +271,7 @@ class TestMongoManager:
             mock_result = Mock()
             mock_result.deleted_count = 1
 
-            mock_collection.delete_one.return_value = mock_result
+            mock_collection.delete_one = AsyncMock(return_value=mock_result)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -288,7 +291,7 @@ class TestMongoManager:
             mock_database = Mock()
             mock_collection = Mock()
 
-            mock_collection.find_one.return_value = {"user_id": "test_user_123"}
+            mock_collection.find_one = AsyncMock(return_value={"user_id": "test_user_123"})
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -308,7 +311,7 @@ class TestMongoManager:
             mock_database = Mock()
             mock_collection = Mock()
 
-            mock_collection.find_one.return_value = None
+            mock_collection.find_one = AsyncMock(return_value=None)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -406,7 +409,7 @@ class TestMongoManager:
             mock_database = Mock()
             mock_collection = Mock()
 
-            mock_collection.insert_one.side_effect = Exception("Database error")
+            mock_collection.insert_one = AsyncMock(side_effect=Exception("Database error"))
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -459,7 +462,7 @@ class TestMongoManager:
                 "api_secret": "test_api_secret"
             }
 
-            mock_collection.find_one.return_value = mock_user_data
+            mock_collection.find_one = AsyncMock(return_value=mock_user_data)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
@@ -483,7 +486,7 @@ class TestMongoManager:
                 "wallet_address": "0x1234567890123456789012345678901234567890"
             }
 
-            mock_collection.find_one.return_value = mock_user_data
+            mock_collection.find_one = AsyncMock(return_value=mock_user_data)
             mock_database.get_collection.return_value = mock_collection
             mock_client.get_database.return_value = mock_database
             mock_client_class.return_value = mock_client
