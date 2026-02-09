@@ -36,7 +36,7 @@ class DatabaseManager:
             DatabaseManager._initialized = True
             logger.info("DatabaseManager 初始化")
 
-    async def initialize(self, connection_string: Optional[str] = None):
+    async def initialize(self, connection_string: Optional[str] = None, db_name: Optional[str] = None):
         """初始化數據庫連接"""
         async with self._lock:
             if self.client is not None:
@@ -44,6 +44,7 @@ class DatabaseManager:
                 return
 
             self.connection_string = connection_string or os.getenv("MONGODB_URI")
+            target_db_name = db_name or os.getenv("DB_NAME")
 
             if not self.connection_string:
                 raise ValueError("MongoDB 連接字符串未提供")
@@ -70,19 +71,33 @@ class DatabaseManager:
                 )
 
                 # 獲取數據庫
-                self.db = self.client.get_default_database()
+                if target_db_name:
+                    self.db = self.client[target_db_name]
+                    logger.info(f"使用指定數據庫: {target_db_name}")
+                else:
+                    try:
+                        self.db = self.client.get_default_database()
+                        target_db_name = self.db.name
+                        logger.info(f"使用默認數據庫: {target_db_name}")
+                    except Exception:
+                        # Fallback for when no default db in URI
+                        target_db_name = "grid_bot"
+                        self.db = self.client[target_db_name]
+                        logger.warning(f"無法獲取默認數據庫，使用默認名稱: {target_db_name}")
 
                 # 🚀 優化：創建 MongoManager 實例，復用現有客戶端連接池
-                self.mongo_manager = MongoManager(existing_client=self.client)
+                self.mongo_manager = MongoManager(existing_client=self.client, db_name=target_db_name)
 
                 # 測試連接
                 await self.client.admin.command('ping')
 
                 logger.info("MongoDB 連接初始化成功")
 
-                # 初始化索引
-                await self._ensure_indexes()
-
+                # 初始化索引 (異步後台執行，避免阻塞啟動)
+                # 注意：這可能會導致啟動初期部分索引尚未就緒，但在 PermissionDenied 的情況下這是必要的容錯
+                asyncio.create_task(self._ensure_indexes())
+                logger.info("已啟動後台索引創建任務")
+            
             except Exception as e:
                 logger.error(f"MongoDB 連接初始化失敗: {e}")
                 await self.close()

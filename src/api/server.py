@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
     """應用啟動時的初始化"""
     try:
         # 初始化統一數據庫連接
-        await db_manager.initialize(os.getenv("MONGODB_URI"))
+        await db_manager.initialize(os.getenv("MONGODB_URI"), db_name=os.getenv("DB_NAME"))
         logger.info("統一數據庫連接已初始化")
 
         # 啟動系統監控器
@@ -322,29 +322,48 @@ async def enable_bot_trading(request: Request, config: RegisterConfig):
         current_mongo_manager = await get_current_mongo_manager()
 
         # 檢查用戶是否已存在
-        if not await current_mongo_manager.get_user(config.user_id):
-            raise GridTradingException(
-                error_code=ErrorCode.USER_NOT_FOUND,
-                details={"user_id": config.user_id}
-            )
-
         config.user_api_key = "ed25519:" + config.user_api_key
         config.user_api_secret = "ed25519:" + config.user_api_secret
 
-        # 更新用戶API密鑰對
-        result = await current_mongo_manager.update_user_api_key_pair(
-            config.user_id,
-            config.user_api_key,
-            config.user_api_secret,
-        )
-
-        if not result.modified_count:
-            raise GridTradingException(
-                error_code=ErrorCode.USER_API_KEY_PAIR_UPDATE_FAILED,
-                details={"user_id": config.user_id}
+        # 檢查用戶是否已存在
+        user = await current_mongo_manager.get_user(config.user_id)
+        
+        if not user:
+            # 用戶不存在，創建新用戶
+            logger.info(f"用戶 {config.user_id} 不存在，正在創建新用戶")
+            await current_mongo_manager.create_user(
+                user_id=config.user_id,
+                api_key=config.user_api_key,
+                api_secret=config.user_api_secret,
+                wallet_address=config.user_id  # 假設 user_id 即為 wallet_address
+            )
+            return {"success": True, "data": {"user_id": config.user_id, "action": "created"}}
+        else:
+            # 用戶已存在
+            found_user_id = user.get("user_id")
+            logger.info(f"用戶已存在: {config.user_id}, 數據庫 user_id: {found_user_id}")
+            
+            # 使用數據庫中的 user_id 進行更新 (確保能匹配到)
+            target_id = found_user_id if found_user_id else config.user_id
+            
+            # 更新用戶API密鑰對
+            result = await current_mongo_manager.update_user_api_key_pair(
+                target_id,
+                config.user_api_key,
+                config.user_api_secret,
             )
 
-        return {"success": True, "data": {"user_id": config.user_id}}
+            if not result.modified_count:
+                # 如果沒有修改，可能是因為值相同，這不一定是錯誤，但如果連匹配都沒匹配到則是錯誤
+                if result.matched_count == 0:
+                    raise GridTradingException(
+                        error_code=ErrorCode.USER_NOT_FOUND,
+                        details={"user_id": config.user_id}
+                    )
+                logger.info(f"用戶 {config.user_id} API Key 未變更")
+            
+            return {"success": True, "data": {"user_id": config.user_id, "action": "updated"}}
+
         
     except GridTradingException:
         raise

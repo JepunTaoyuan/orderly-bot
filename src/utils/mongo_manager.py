@@ -39,10 +39,21 @@ class MongoManager:
             self.client = AsyncIOMotorClient(uri)
 
         if self.client:
-            # 如果有現有客戶端，使用默認數據庫；否則使用指定的 db_name
+            # 如果有現有客戶端
             if existing_client:
-                self.db = self.client.get_default_database()
-                self.db_name = self.db.name
+                # 如果指定了具體的 db_name (不是默認值)，則使用該名稱
+                if db_name and db_name != "grid_bot":
+                    self.db = self.client[db_name]
+                    self.db_name = db_name
+                else:
+                    # 否則嘗試使用連接字符串中的默認數據庫
+                    try:
+                        self.db = self.client.get_default_database()
+                        self.db_name = self.db.name
+                    except Exception:
+                        # 如果無法獲取默認數據庫，回退到 grid_bot
+                        self.db = self.client[db_name]
+                        self.db_name = db_name
             else:
                 self.db = self.client.get_database(db_name)
 
@@ -140,8 +151,17 @@ class MongoManager:
 
         update_data["updated_at"] = time.time()
 
+        # 使用更靈活的過濾條件，因為文檔可能通過 user_id, _id 或 wallet_address 識別
+        filter_query = {
+            "$or": [
+                {"user_id": user_id},
+                {"_id": user_id},
+                {"wallet_address": user_id}
+            ]
+        }
+
         result = await collection.update_one(
-            {"user_id": user_id},
+            filter_query,
             {"$set": update_data}
         )
 
@@ -467,3 +487,21 @@ class MongoManager:
         except Exception as e:
             logger.error(f"檢查用戶API密鑰是否存在失敗: {e}")
             return False
+
+    async def update_user_api_key_pair(self, user_id: str, api_key: str, api_secret: str) -> Any:
+        """
+        更新用戶API密鑰對
+
+        Args:
+            user_id: 用戶ID
+            api_key: API密鑰
+            api_secret: API密碼
+
+        Returns:
+            更新結果
+        """
+        update_data = {
+            "api_key": api_key,
+            "api_secret": api_secret,
+        }
+        return await self.update_user(user_id, update_data)
