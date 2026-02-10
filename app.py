@@ -21,7 +21,7 @@ def main():
         "src.api.server:app",  # 使用字符串導入以支持 reload
         host=os.getenv("UVICORN_HOST", "0.0.0.0"),
         port=int(os.getenv("UVICORN_PORT", "8001")),
-        workers=1 if debug_mode else 4,
+        workers=1,
         reload=debug_mode,
         log_level="info"
     )

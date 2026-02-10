@@ -58,7 +58,7 @@ class OrderlyClient:
         }
 
         # ⭐ 新增：智能速率控制和排隊機制
-        self.rate_limiter = {
+        self._rate_control = {
             "min_interval": 0.1,      # 最小請求間隔（秒）
             "max_interval": 5.0,      # 最大請求間隔（秒）
             "current_interval": 0.1,  # 當前請求間隔
@@ -211,66 +211,66 @@ class OrderlyClient:
     async def _wait_for_rate_limit(self):
         """⭐ 新增：智能速率限制等待"""
         current_time = time.time()
-        time_since_last_request = current_time - self.rate_limiter["last_request_time"]
+        time_since_last_request = current_time - self._rate_control["last_request_time"]
 
         # 如果距離上次請求時間不足，等待
-        if time_since_last_request < self.rate_limiter["current_interval"]:
-            wait_time = self.rate_limiter["current_interval"] - time_since_last_request
+        if time_since_last_request < self._rate_control["current_interval"]:
+            wait_time = self._rate_control["current_interval"] - time_since_last_request
             logger.debug(f"速率限制等待: {wait_time:.3f}s", event_type="rate_limit_wait", data={
                 "wait_time": wait_time,
-                "current_interval": self.rate_limiter["current_interval"],
+                "current_interval": self._rate_control["current_interval"],
                 "time_since_last": time_since_last_request
             })
             await asyncio.sleep(wait_time)
 
-        self.rate_limiter["last_request_time"] = time.time()
+        self._rate_control["last_request_time"] = time.time()
 
     def _update_rate_limit_on_success(self, response_time: float):
         """⭐ 新增：成功時更新速率限制"""
-        self.rate_limiter["consecutive_success"] += 1
-        self.rate_limiter["consecutive_errors"] = 0
+        self._rate_control["consecutive_success"] += 1
+        self._rate_control["consecutive_errors"] = 0
 
         # 連續成功時逐漸降低間隔（提高請求頻率）
-        if (self.rate_limiter["consecutive_success"] >= 3 and
-            self.rate_limiter["current_interval"] > self.rate_limiter["min_interval"]):
+        if (self._rate_control["consecutive_success"] >= 3 and
+            self._rate_control["current_interval"] > self._rate_control["min_interval"]):
 
-            new_interval = (self.rate_limiter["current_interval"] *
-                          self.rate_limiter["recovery_multiplier"])
-            new_interval = max(new_interval, self.rate_limiter["min_interval"])
+            new_interval = (self._rate_control["current_interval"] *
+                          self._rate_control["recovery_multiplier"])
+            new_interval = max(new_interval, self._rate_control["min_interval"])
 
-            if new_interval != self.rate_limiter["current_interval"]:
-                logger.debug(f"速率限制恢復: {self.rate_limiter['current_interval']:.3f}s -> {new_interval:.3f}s",
+            if new_interval != self._rate_control["current_interval"]:
+                logger.debug(f"速率限制恢復: {self._rate_control['current_interval']:.3f}s -> {new_interval:.3f}s",
                            event_type="rate_limit_recovery", data={
-                               "old_interval": self.rate_limiter["current_interval"],
+                               "old_interval": self._rate_control["current_interval"],
                                "new_interval": new_interval,
-                               "consecutive_success": self.rate_limiter["consecutive_success"]
+                               "consecutive_success": self._rate_control["consecutive_success"]
                            })
 
-                self.rate_limiter["current_interval"] = new_interval
+                self._rate_control["current_interval"] = new_interval
 
     def _update_rate_limit_on_error(self, is_rate_limit: bool):
         """⭐ 新增：錯誤時更新速率限制"""
-        self.rate_limiter["consecutive_errors"] += 1
-        self.rate_limiter["consecutive_success"] = 0
+        self._rate_control["consecutive_errors"] += 1
+        self._rate_control["consecutive_success"] = 0
 
         # 如果是速率限制錯誤或連續錯誤過多，增加間隔
         should_backoff = (is_rate_limit or
-                         self.rate_limiter["consecutive_errors"] >= self.rate_limiter["error_threshold"])
+                         self._rate_control["consecutive_errors"] >= self._rate_control["error_threshold"])
 
-        if should_backoff and self.rate_limiter["current_interval"] < self.rate_limiter["max_interval"]:
-            new_interval = (self.rate_limiter["current_interval"] *
-                          self.rate_limiter["backoff_multiplier"])
-            new_interval = min(new_interval, self.rate_limiter["max_interval"])
+        if should_backoff and self._rate_control["current_interval"] < self._rate_control["max_interval"]:
+            new_interval = (self._rate_control["current_interval"] *
+                          self._rate_control["backoff_multiplier"])
+            new_interval = min(new_interval, self._rate_control["max_interval"])
 
-            logger.warning(f"速率限制退避: {self.rate_limiter['current_interval']:.3f}s -> {new_interval:.3f}s",
+            logger.warning(f"速率限制退避: {self._rate_control['current_interval']:.3f}s -> {new_interval:.3f}s",
                          event_type="rate_limit_backoff", data={
-                             "old_interval": self.rate_limiter["current_interval"],
+                             "old_interval": self._rate_control["current_interval"],
                              "new_interval": new_interval,
-                             "consecutive_errors": self.rate_limiter["consecutive_errors"],
+                             "consecutive_errors": self._rate_control["consecutive_errors"],
                              "is_rate_limit": is_rate_limit
                          })
 
-            self.rate_limiter["current_interval"] = new_interval
+            self._rate_control["current_interval"] = new_interval
 
     def _analyze_api_response(self, response: Any, endpoint_name: str) -> Dict[str, Any]:
         """⭐ 新增：分析API響應"""

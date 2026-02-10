@@ -7,7 +7,7 @@
 import functools
 from typing import Dict, Any, Optional
 from fastapi import Request, HTTPException
-from src.services.database_service import MongoManager
+from src.utils.mongo_manager import MongoManager
 from src.auth.wallet_signature import WalletSignatureVerifier
 from src.utils.logging_config import get_logger
 from src.utils.error_codes import GridTradingException, ErrorCode

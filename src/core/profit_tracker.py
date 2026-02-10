@@ -13,7 +13,6 @@ from datetime import datetime
 from enum import Enum
 import json
 from src.utils.logging_config import get_logger
-import builtins
 
 logger = get_logger("profit_tracker")
 
@@ -130,9 +129,6 @@ class ProfitTracker:
 
         # 資金利用率相關
         self.total_margin_allocated: Decimal = Decimal('0')  # 總分配保證金
-
-    builtins.Trade = Trade
-    builtins.Position = Position
 
     def set_total_margin(self, total_margin: Decimal):
         """

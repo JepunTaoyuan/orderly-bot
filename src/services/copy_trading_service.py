@@ -6,13 +6,14 @@ Copy Trading Session Manager
 """
 
 import asyncio
+import os
 import time
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Callable
 from src.core.leader_monitor import LeaderMonitor
 from src.core.copy_trading_bot import CopyTradingBot
 from src.core.risk_controller import RiskController
-from src.services.database_service import MongoManager
+from src.utils.mongo_manager import MongoManager
 from src.services.database_connection import db_manager
 from src.utils.logging_config import get_logger
 from src.utils.error_codes import ErrorCode, GridTradingException
@@ -449,7 +450,7 @@ class CopyTradingSessionManager:
             success = await monitor.start_monitoring(
                 orderly_key=user_data.get("api_key"),
                 orderly_secret=user_data.get("api_secret"),
-                orderly_testnet=True  # TODO: 從配置讀取
+                orderly_testnet=os.getenv("ORDERLY_TESTNET", "true").lower() == "true"
             )
 
             if success:
@@ -644,7 +645,7 @@ class CopyTradingSessionManager:
                 follower_id=follower_id,
                 orderly_key=follower_user.get("api_key"),
                 orderly_secret=follower_user.get("api_secret"),
-                orderly_testnet=True  # TODO: 從配置讀取
+                orderly_testnet=os.getenv("ORDERLY_TESTNET", "true").lower() == "true"
             )
 
             # 啟動跟單

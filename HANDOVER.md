@@ -7,24 +7,59 @@
 ## 目錄
 
 1. [專案概述](#專案概述)
-2. [最近更新（2026-02-09）](#最近更新2026-02-09)
-3. [30 分鐘上手清單](#30-分鐘上手清單)
-4. [技術架構](#技術架構)
-5. [目錄結構](#目錄結構)
-6. [核心模組說明](#核心模組說明)
-7. [API 端點](#api-端點)
-8. [資料庫結構](#資料庫結構)
-9. [網格策略](#網格策略)
-10. [環境配置](#環境配置)
-11. [部署指南](#部署指南)
-12. [日常維護](#日常維護)
-13. [開發指南](#開發指南)
+2. [最近更新（2026-02-10）](#最近更新2026-02-10)
+3. [已知技術債務](#已知技術債務)
+4. [30 分鐘上手清單](#30-分鐘上手清單)
+5. [技術架構](#技術架構)
+6. [目錄結構](#目錄結構)
+7. [核心模組說明](#核心模組說明)
+8. [API 端點](#api-端點)
+9. [資料庫結構](#資料庫結構)
+10. [網格策略](#網格策略)
+11. [環境配置](#環境配置)
+12. [部署指南](#部署指南)
+13. [日常維護](#日常維護)
+14. [開發指南](#開發指南)
 
 ---
 
-## 最近更新（2026-02-09）
+## 最近更新（2026-02-10）
 
-### 本次完成項目
+### 本次完成項目：Code Review 與安全修復
+
+對 `src/api/server.py`、`src/core/client.py`、`src/services/session_service.py`、`src/auth/` 等核心模組進行全面 code review，識別多項問題並進行修復。
+
+1. **[已修復] 重複的 `StopConfig` 類別定義**
+   - `server.py` 中存在兩個同名 `StopConfig` Pydantic model（分別用於 `/api/grid/stop` 和 `/api/grid/teststop`）。
+   - Python 會使後者覆蓋前者，造成命名衝突風險。
+   - 已將 `/api/grid/teststop` 使用的 model 重命名為 `TestStopConfig`，handler 重命名為 `test_stop_grid`。
+
+2. **[已修復] `/api/grid/teststop` 端點缺少認證保護**
+   - 此端點繞過簽名驗證，在 production 環境中任何人可停止任何 session。
+   - 已添加 `DEBUG` 環境變數檢查，非 debug 模式下返回 404。
+
+3. **其他已識別問題記錄於「已知技術債務」區段**
+   - CORS 寫死 localhost origins
+   - `client.py` 中 `rate_limiter` vs `_rate_control` 混用
+   - SSE stream 認證參數暴露在 query string
+   - 與 orderly_refer 重複的錢包驗證器代碼
+
+### 驗證結果
+
+- `StopConfig` 重命名為 `TestStopConfig`：確認 `/api/grid/stop` 和 `/api/grid/teststop` 使用不同 model
+- `/api/grid/teststop` 新增 `DEBUG` 環境變數保護
+
+### 交接提醒
+
+1. `/api/grid/teststop` 僅在 `DEBUG=true` 時可用。生產環境不會暴露此端點。
+2. 修改錢包驗證邏輯時請同步檢查 orderly_refer 的 `wallet_verifier.py`。
+3. CORS origins 目前寫死在 `server.py`，擴展部署時需手動修改或改為環境變數讀取。
+
+---
+
+### 歷史更新（2026-02-09）
+
+#### 完成項目
 
 1. **測試冗餘清理**
    - 刪除重複測試檔：`tests/unit/test_mongo_manager_backup.py`
@@ -109,6 +144,23 @@ pytest -q tests/unit/test_grid_signal.py
    - 先檢查 `.env` 必填欄位，特別是 Orderly 與 MongoDB 設定。
 3. 測試不穩定或依賴外部狀態
    - 先跑單檔測試定位，再跑全量測試。
+
+---
+
+## 已知技術債務
+
+> 以下為 2026-02-10 code review 識別的問題，按優先級排列。修復時請一併更新此區段。
+
+| # | 優先級 | 模組 | 問題描述 | 建議修復方式 |
+|---|--------|------|----------|-------------|
+| 1 | ~~高~~ 已修復 | `server.py` | 重複的 `StopConfig` 類別定義 | 已重命名為 `TestStopConfig` |
+| 2 | ~~高~~ 已修復 | `server.py` | `/api/grid/teststop` 缺少認證保護 | 已添加 `DEBUG` 環境變數檢查 |
+| 3 | 中 | `server.py` | CORS origins 寫死 localhost 和 Vercel URL | 改為從 `.env` 的 `CORS_ORIGINS` 讀取，與 orderly_refer 做法一致 |
+| 4 | 中 | `client.py` | `_monitor_api_call` 中混用 `self.rate_limiter`（物件）和 `self._rate_control`（字典） | 統一使用 `self._rate_control` 作為字典存取 |
+| 5 | 中 | `server.py` | `stop_grid` 函式名重複定義（`/api/grid/stop` 和 `/api/grid/teststop`） | 已修復，後者重命名為 `test_stop_grid` |
+| 6 | 低 | `server.py` | SSE stream `/api/grid/stream/{user_id}` 認證參數通過 query string 傳遞，可能在 access log 洩露 | 改為使用 headers 或 token-based 認證 |
+| 7 | 低 | `server.py` | `get_profit_report` 直接存取 `session_manager.sessions` 和 `_sessions_lock`，違反封裝 | 在 `SessionManager` 中新增 `get_bot_profit_report(session_id)` 方法 |
+| 8 | 低 | `auth/wallet_signature.py` | 與 orderly_refer 的 `wallet_verifier.py` 高度重複 | 長期抽取為共享 package |
 
 ---
 

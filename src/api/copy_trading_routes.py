@@ -7,6 +7,7 @@ Copy Trading API 端點
 
 import asyncio
 import json
+import os
 import time
 from typing import Optional
 from datetime import datetime
@@ -23,6 +24,15 @@ from src.utils.resilient_handler import api_retry
 from src.auth.auth_decorators import WalletAuthContext
 
 logger = get_logger("copy_trading_routes")
+
+async def _verify_admin(request: Request):
+    """驗證管理員 API 密鑰"""
+    admin_key = os.getenv("ADMIN_API_KEY")
+    if not admin_key:
+        raise HTTPException(status_code=503, detail="管理員功能未配置")
+    request_key = request.headers.get("X-Admin-API-Key")
+    if not request_key or request_key != admin_key:
+        raise HTTPException(status_code=403, detail="需要管理員權限")
 
 # 創建路由器
 router = APIRouter(prefix="/api/copy", tags=["Copy Trading"])
@@ -567,12 +577,26 @@ async def get_copy_trades(
 
 
 @router.get("/stream/{user_id}")
-async def stream_copy_events(request: Request, user_id: str):
+async def stream_copy_events(
+    request: Request,
+    user_id: str,
+    user_sig: str = "",
+    timestamp: int = 0,
+    nonce: str = ""
+):
     """
     SSE 即時跟單更新推送
 
     推送跟單執行結果、風控警告等事件
     """
+    if not user_sig or not timestamp or not nonce:
+        raise HTTPException(status_code=401, detail="需要認證參數")
+    try:
+        from src.auth.auth_decorators import verify_wallet_signature_db
+        await verify_wallet_signature_db(user_id, user_sig, timestamp, nonce)
+    except Exception as e:
+        raise HTTPException(status_code=403, detail="認證失敗")
+
     async def event_generator():
         manager = await get_copy_trading_manager()
         event_queue = asyncio.Queue()
@@ -615,7 +639,7 @@ async def stream_copy_events(request: Request, user_id: str):
 
         except Exception as e:
             logger.error(f"SSE 流錯誤: {e}")
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'stream_error'})}\n\n"
 
         finally:
             # 取消註冊
@@ -624,7 +648,6 @@ async def stream_copy_events(request: Request, user_id: str):
     headers = {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
     }
 
     return StreamingResponse(
@@ -643,6 +666,7 @@ async def list_pending_leaders(request: Request):
     獲取待審核的 Leader 申請列表 (管理員用)
     """
     try:
+        await _verify_admin(request)
         manager = await get_copy_trading_manager()
         applications = await manager.get_pending_leader_applications()
 
@@ -669,6 +693,7 @@ async def approve_leader(request: Request, config: AdminApproveRequest):
     審核通過 Leader 申請 (管理員用)
     """
     try:
+        await _verify_admin(request)
         manager = await get_copy_trading_manager()
         result = await manager.approve_leader(config.user_id, config.admin_id)
 
@@ -692,6 +717,7 @@ async def reject_leader(request: Request, config: AdminApproveRequest):
     拒絕 Leader 申請 (管理員用)
     """
     try:
+        await _verify_admin(request)
         manager = await get_copy_trading_manager()
         result = await manager.reject_leader(
             config.user_id,
@@ -719,6 +745,7 @@ async def get_copy_trading_stats(request: Request):
     獲取 Copy Trading 系統統計 (管理員用)
     """
     try:
+        await _verify_admin(request)
         manager = await get_copy_trading_manager()
         stats = manager.get_stats()
 

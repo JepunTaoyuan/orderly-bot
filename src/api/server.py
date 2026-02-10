@@ -144,8 +144,8 @@ async def lifespan(app: FastAPI):
         logger.info("應用初始化完成")
 
     except Exception as e:
-        logger.error(f"安全組件初始化失敗: {e}")
-        # 初始化失敗不應該阻止應用啟動
+        logger.error(f"關鍵組件初始化失敗，應用無法安全運行: {e}")
+        raise
 
     # 應用運行期間
     yield
@@ -442,8 +442,8 @@ class StartConfig(BaseModel):
     lower_bound: float = Field(..., gt=0)
     grid_type: str = Field("ARITHMETIC", pattern="^(ARITHMETIC|GEOMETRIC)$")
     grid_ratio: Optional[float] = Field(None, gt=0, lt=1)
-    grid_levels: int = Field(..., ge=2)
-    total_margin: float = Field(..., gt=0)
+    grid_levels: int = Field(..., ge=2, le=200)
+    total_margin: float = Field(..., gt=0, le=1_000_000)
     stop_bot_price: Optional[float] = Field(None, gt=0)
     stop_top_price: Optional[float] = Field(None, gt=0)
     user_id: str = Field(..., min_length=1)
@@ -1032,7 +1032,7 @@ async def get_challenge(request: Request):
             original_error=e
         )
 
-class StopConfig(BaseModel):
+class TestStopConfig(BaseModel):
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "session_id": "user123_PERP_ETH_USDC",
@@ -1044,7 +1044,12 @@ class StopConfig(BaseModel):
 @app.post("/api/grid/teststop")
 @limiter.limit(RATE_LIMITS['grid_control'])
 @api_retry
-async def stop_grid(request: Request, config: StopConfig):
+async def test_stop_grid(request: Request, config: TestStopConfig):
+    # 僅在 DEBUG 模式下可用
+    debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    if not debug_mode:
+        raise HTTPException(status_code=404, detail="Not Found")
+
     session_id = validate_session_id(config.session_id)
 
     # 解析 user_id
@@ -1059,14 +1064,14 @@ async def stop_grid(request: Request, config: StopConfig):
 
     with SessionContextManager(session_id):
         try:
-            logger.info("停止網格交易請求", event_type="grid_stop", data={"session_id": session_id})
+            logger.info("停止網格交易請求 (test)", event_type="grid_test_stop", data={"session_id": session_id})
             metrics.increment_counter("api.grid.stop.requests")
             
             success = await session_manager.stop_session(session_id)
             
             if success:
                 metrics.increment_counter("api.grid.stop.success")
-                logger.info("網格交易停止成功", event_type="grid_stopped", data={"session_id": session_id})
+                logger.info("網格交易停止成功 (test)", event_type="grid_test_stopped", data={"session_id": session_id})
                 return {"success": True, "data": {"status": "stopped", "session_id": session_id}}
             else:
                 # 會話不存在的情況
@@ -1080,7 +1085,7 @@ async def stop_grid(request: Request, config: StopConfig):
             raise
         except Exception as e:
             metrics.increment_counter("api.grid.stop.errors")
-            logger.error("停止網格交易失敗", event_type="grid_stop_error", data={
+            logger.error("停止網格交易失敗 (test)", event_type="grid_test_stop_error", data={
                 "session_id": session_id,
                 "error": str(e)
             })
@@ -1315,10 +1320,24 @@ async def get_user_grid_statistics(request: Request, user_id: str):
         )
 
 @app.get("/api/grid/stream/{user_id}")
-async def stream_user_strategies(request: Request, user_id: str):
+async def stream_user_strategies(
+    request: Request,
+    user_id: str,
+    user_sig: str = "",
+    timestamp: int = 0,
+    nonce: str = ""
+):
     """
     🚀 優化版本：智能 SSE 流，支持緩存、變化檢測和動態頻率調整
     """
+    if not user_sig or not timestamp or not nonce:
+        raise HTTPException(status_code=401, detail="需要認證參數")
+    try:
+        from src.auth.auth_decorators import verify_wallet_signature_db
+        await verify_wallet_signature_db(user_id, user_sig, timestamp, nonce)
+    except Exception as e:
+        raise HTTPException(status_code=403, detail="認證失敗")
+
     async def event_generator():
         try:
             # SSE 連接狀態
@@ -1378,7 +1397,7 @@ async def stream_user_strategies(request: Request, user_id: str):
 
                     # 🚀 優化：計算載荷哈希檢測變化
                     payload_str = json.dumps(payload, sort_keys=True)
-                    current_hash = hashlib.md5(payload_str.encode()).hexdigest()
+                    current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
 
                     # 只有在數據變化時才發送完整載荷
                     if current_hash != last_payload_hash:
@@ -1406,19 +1425,17 @@ async def stream_user_strategies(request: Request, user_id: str):
 
                 except Exception as e:
                     logger.error(f"SSE 流處理錯誤: {e}")
-                    yield "event: error\n" + f"data: {json.dumps({'message': f'stream_error: {str(e)}'})}\n\n"
+                    yield "event: error\n" + f"data: {json.dumps({'message': 'stream_error'})}\n\n"
                     await asyncio.sleep(5.0)  # 錯誤時等待更長時間
 
         except Exception as e:
             logger.error(f"SSE 生成器錯誤: {e}")
-            yield "event: error\n" + f"data: {json.dumps({'message': 'generator_error', 'error': str(e)})}\n\n"
+            yield "event: error\n" + f"data: {json.dumps({'message': 'generator_error'})}\n\n"
 
     # 🚀 優化：添加響應頭優化客戶端體驗
     headers = {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Credentials': 'true'
     }
 
     return StreamingResponse(

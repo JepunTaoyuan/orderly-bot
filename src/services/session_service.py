@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, Set, List
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from src.core.grid_bot import GridTradingBot
-from src.services.database_service import MongoManager
+from src.utils.mongo_manager import MongoManager
 from src.services.database_connection import db_manager
 from src.utils.logging_config import get_logger, metrics
 from src.utils.error_codes import GridTradingException, ErrorCode
