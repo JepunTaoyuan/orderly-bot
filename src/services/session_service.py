@@ -90,6 +90,20 @@ class SessionManager(SessionManagerInterface):
             'rate_limited': 0
         }
 
+    async def get_bot(self, session_id: str) -> "GridTradingBot":
+        """Get a bot instance by session ID.
+
+        Raises:
+            GridTradingException: If session not found
+        """
+        async with self._sessions_lock:
+            if session_id not in self.sessions:
+                raise GridTradingException(
+                    error_code=ErrorCode.SESSION_NOT_FOUND,
+                    details={"session_id": session_id}
+                )
+            return self.sessions[session_id]
+
     async def initialize(self):
         """初始化 SessionManager，設置 MongoManager、緩存和對象池"""
         if self.mongo_manager is None:

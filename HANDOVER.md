@@ -7,160 +7,19 @@
 ## 目錄
 
 1. [專案概述](#專案概述)
-2. [最近更新（2026-02-10）](#最近更新2026-02-10)
-3. [已知技術債務](#已知技術債務)
-4. [30 分鐘上手清單](#30-分鐘上手清單)
-5. [技術架構](#技術架構)
-6. [目錄結構](#目錄結構)
-7. [核心模組說明](#核心模組說明)
-8. [API 端點](#api-端點)
-9. [資料庫結構](#資料庫結構)
-10. [網格策略](#網格策略)
-11. [環境配置](#環境配置)
-12. [部署指南](#部署指南)
-13. [日常維護](#日常維護)
-14. [開發指南](#開發指南)
-
----
-
-## 最近更新（2026-02-10）
-
-### 本次完成項目：Code Review 與安全修復
-
-對 `src/api/server.py`、`src/core/client.py`、`src/services/session_service.py`、`src/auth/` 等核心模組進行全面 code review，識別多項問題並進行修復。
-
-1. **[已修復] 重複的 `StopConfig` 類別定義**
-   - `server.py` 中存在兩個同名 `StopConfig` Pydantic model（分別用於 `/api/grid/stop` 和 `/api/grid/teststop`）。
-   - Python 會使後者覆蓋前者，造成命名衝突風險。
-   - 已將 `/api/grid/teststop` 使用的 model 重命名為 `TestStopConfig`，handler 重命名為 `test_stop_grid`。
-
-2. **[已修復] `/api/grid/teststop` 端點缺少認證保護**
-   - 此端點繞過簽名驗證，在 production 環境中任何人可停止任何 session。
-   - 已添加 `DEBUG` 環境變數檢查，非 debug 模式下返回 404。
-
-3. **其他已識別問題記錄於「已知技術債務」區段**
-   - CORS 寫死 localhost origins
-   - `client.py` 中 `rate_limiter` vs `_rate_control` 混用
-   - SSE stream 認證參數暴露在 query string
-   - 與 orderly_refer 重複的錢包驗證器代碼
-
-### 驗證結果
-
-- `StopConfig` 重命名為 `TestStopConfig`：確認 `/api/grid/stop` 和 `/api/grid/teststop` 使用不同 model
-- `/api/grid/teststop` 新增 `DEBUG` 環境變數保護
-
-### 交接提醒
-
-1. `/api/grid/teststop` 僅在 `DEBUG=true` 時可用。生產環境不會暴露此端點。
-2. 修改錢包驗證邏輯時請同步檢查 orderly_refer 的 `wallet_verifier.py`。
-3. CORS origins 目前寫死在 `server.py`，擴展部署時需手動修改或改為環境變數讀取。
-
----
-
-### 歷史更新（2026-02-09）
-
-#### 完成項目
-
-1. **測試冗餘清理**
-   - 刪除重複測試檔：`tests/unit/test_mongo_manager_backup.py`
-   - 保留單一維護來源：`tests/unit/test_mongo_manager.py`
-   - 目的：避免同一組測試邏輯重複維護與結果重複計算。
-
-2. **測試修復：AsyncMock 對齊非同步 Mongo 操作**
-   - 將 `insert_one/find_one/update_one/delete_one` 等被 `await` 的 mock，統一改為 `AsyncMock`。
-   - 修正 `get_user()` 測試期望，對齊實作中的三段查詢 fallback（`user_id` → `_id` → `wallet_address`）。
-   - 主要檔案：
-     - `tests/unit/test_mongo_manager.py`
-
-### 驗證結果
-
-- `pytest -q tests/unit/test_mongo_manager.py` → `22 passed`
-
-### 交接提醒
-
-1. `src/utils/mongo_manager.py` 為 async 介面，新增/修改測試時請使用 `AsyncMock`，避免 `object Mock can't be used in 'await' expression` 類型錯誤。
-2. 後續若擴充 `get_user()` 查找策略，請同步更新：
-   - `tests/unit/test_mongo_manager.py::test_get_user_non_existing`
-3. 本次只做定向測試修復；若要發版建議補跑全量 `pytest`。
-
----
-
-## 30 分鐘上手清單
-
-### 目標
-
-在 30 分鐘內完成：
-1. 本地環境可啟動 API。
-2. 可跑關鍵測試。
-3. 知道第一個要看的模組與常見錯誤處理。
-
-### 0-10 分鐘：環境與依賴
-
-```bash
-cd orderly-bot
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-`.env` 至少確認：
-- `ORDERLY_KEY`
-- `ORDERLY_SECRET`
-- `ORDERLY_ACCOUNT_ID`
-- `MONGODB_URI`
-
-### 10-20 分鐘：啟動與健康檢查
-
-```bash
-python app.py
-# 或
-uvicorn src.api.server:app --host 0.0.0.0 --port 8001 --reload
-```
-
-啟動後驗證：
-```bash
-curl http://localhost:8001/health
-curl http://localhost:8001/metrics
-```
-
-### 20-30 分鐘：關鍵測試與程式入口
-
-```bash
-pytest -q tests/unit/test_mongo_manager.py
-pytest -q tests/unit/test_grid_signal.py
-```
-
-優先閱讀順序：
-1. `src/api/server.py`（入口與路由）
-2. `src/core/grid_bot.py`（交易主流程）
-3. `src/services/session_service.py`（會話管理）
-
-### 常見故障速查
-
-1. `object Mock can't be used in 'await' expression`
-   - 測試中把 `Mock` 改成 `AsyncMock`（尤其 DB async methods）。
-2. 啟動失敗、環境變數缺失
-   - 先檢查 `.env` 必填欄位，特別是 Orderly 與 MongoDB 設定。
-3. 測試不穩定或依賴外部狀態
-   - 先跑單檔測試定位，再跑全量測試。
-
----
-
-## 已知技術債務
-
-> 以下為 2026-02-10 code review 識別的問題，按優先級排列。修復時請一併更新此區段。
-
-| # | 優先級 | 模組 | 問題描述 | 建議修復方式 |
-|---|--------|------|----------|-------------|
-| 1 | ~~高~~ 已修復 | `server.py` | 重複的 `StopConfig` 類別定義 | 已重命名為 `TestStopConfig` |
-| 2 | ~~高~~ 已修復 | `server.py` | `/api/grid/teststop` 缺少認證保護 | 已添加 `DEBUG` 環境變數檢查 |
-| 3 | 中 | `server.py` | CORS origins 寫死 localhost 和 Vercel URL | 改為從 `.env` 的 `CORS_ORIGINS` 讀取，與 orderly_refer 做法一致 |
-| 4 | 中 | `client.py` | `_monitor_api_call` 中混用 `self.rate_limiter`（物件）和 `self._rate_control`（字典） | 統一使用 `self._rate_control` 作為字典存取 |
-| 5 | 中 | `server.py` | `stop_grid` 函式名重複定義（`/api/grid/stop` 和 `/api/grid/teststop`） | 已修復，後者重命名為 `test_stop_grid` |
-| 6 | 低 | `server.py` | SSE stream `/api/grid/stream/{user_id}` 認證參數通過 query string 傳遞，可能在 access log 洩露 | 改為使用 headers 或 token-based 認證 |
-| 7 | 低 | `server.py` | `get_profit_report` 直接存取 `session_manager.sessions` 和 `_sessions_lock`，違反封裝 | 在 `SessionManager` 中新增 `get_bot_profit_report(session_id)` 方法 |
-| 8 | 低 | `auth/wallet_signature.py` | 與 orderly_refer 的 `wallet_verifier.py` 高度重複 | 長期抽取為共享 package |
+2. [30 分鐘上手清單](#30-分鐘上手清單)
+3. [技術架構](#技術架構)
+4. [目錄結構](#目錄結構)
+5. [核心模組說明](#核心模組說明)
+6. [API 端點](#api-端點)
+7. [資料庫結構](#資料庫結構)
+8. [網格策略](#網格策略)
+9. [環境配置](#環境配置)
+10. [部署指南](#部署指南)
+11. [日常維護](#日常維護)
+12. [開發指南](#開發指南)
+13. [已知問題與注意事項](#已知問題與注意事項)
+14. [變更紀錄](#變更紀錄)
 
 ---
 
@@ -196,6 +55,57 @@ graph TD
 
 ---
 
+## 30 分鐘上手清單
+
+### 0-10 分鐘：環境與依賴
+
+```bash
+cd orderly-bot
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+`.env` 至少確認：
+- `ORDERLY_KEY`、`ORDERLY_SECRET`、`ORDERLY_ACCOUNT_ID`
+- `MONGODB_URI`
+
+### 10-20 分鐘：啟動與健康檢查
+
+```bash
+python app.py
+# 或
+uvicorn src.api.server:app --host 0.0.0.0 --port 8001 --reload
+```
+
+```bash
+curl http://localhost:8001/health
+curl http://localhost:8001/metrics
+```
+
+### 20-30 分鐘：關鍵測試與入口
+
+```bash
+pytest -q tests/unit/test_mongo_manager.py
+pytest -q tests/unit/test_grid_signal.py
+```
+
+優先閱讀：
+1. `src/api/server.py` — 入口與路由
+2. `src/core/grid_bot.py` — 交易主流程
+3. `src/services/session_service.py` — 會話管理
+
+### 常見故障速查
+
+| 症狀 | 排查方向 |
+|------|----------|
+| `object Mock can't be used in 'await' expression` | 測試中 `Mock` 改 `AsyncMock`（DB async methods） |
+| 啟動失敗、環境變數缺失 | 檢查 `.env` 必填欄位 |
+| 測試不穩定或依賴外部狀態 | 先跑單檔測試定位，再跑全量測試 |
+
+---
+
 ## 技術架構
 
 ### 技術棧
@@ -205,7 +115,7 @@ graph TD
 | Web 框架 | FastAPI |
 | 資料庫 | MongoDB (Motor async driver) |
 | WebSocket | orderly-evm-connector |
-| 認證 | 錢包簽名 (eth-account, nacl) |
+| 認證 | 錢包簽名 (eth-account, nacl)，共享 `shared/wallet_verifier/` |
 | 限流 | SlowAPI |
 | 監控 | psutil (系統監控) |
 | 容器化 | Docker (multi-stage build) |
@@ -257,11 +167,12 @@ orderly-bot/
 │   │   ├── grid_summary_service.py     # 網格摘要
 │   │   └── database_connection.py      # MongoDB 連接管理
 │   ├── auth/
-│   │   ├── wallet_signature.py         # 錢包簽名驗證
+│   │   ├── wallet_signature.py         # 錢包簽名驗證（繼承 shared/wallet_verifier）
 │   │   └── auth_decorators.py          # 認證裝飾器
 │   ├── models/
 │   │   └── grid_summary.py             # 網格摘要模型
 │   └── utils/
+│       ├── cors_config.py              # CORS 配置（從環境變數讀取）
 │       ├── session_manager.py          # 會話狀態管理
 │       ├── event_queue.py              # 有序事件處理
 │       ├── market_validator.py         # 價格/數量驗證
@@ -284,98 +195,54 @@ orderly-bot/
 
 ### 1. 網格交易機器人 (`grid_bot.py`)
 
-**核心類別：`GridTradingBot`**
-
-這是整個系統的核心，負責：
-- 訂單生命週期管理
-- WebSocket 連接與事件處理
-- 訂單成交後的反向訂單生成
-- 利潤追蹤
-
-**關鍵機制：**
+核心類別 `GridTradingBot`，負責訂單生命週期管理、WebSocket 事件處理、反向訂單生成、利潤追蹤。
 
 | 機制 | 說明 |
 |------|------|
 | 斷路器 (Circuit Breaker) | WebSocket 連續失敗時熔斷，防止野蠻重連 |
 | 重複訂單檢查 | 防止同價位重複下單 |
-| 並發控制 | asyncio.Lock 保護共享狀態 |
+| 並發控制 | `asyncio.Lock` 保護共享狀態 |
 | 事件去重 | 避免 WebSocket 重複事件 |
 
-**WebSocket 重連策略：**
-```python
-# 指數退避重連
-base_delay = 3 秒
-max_delay = 120 秒
-max_retries = 8
-delay = min(base_delay * (2 ** retry_count), max_delay)
-```
-
----
+**WebSocket 重連策略：** 指數退避，base 3s，max 120s，max retries 8。
 
 ### 2. 訊號生成器 (`grid_signal.py`)
-
-**支持的網格類型：**
 
 #### 等差網格 (ARITHMETIC)
 ```
 價格間距 = (上界 - 下界) / (網格數 - 1)
 ```
-- 適合：震盪行情、價格波動穩定
-- 特點：固定價格間距
 
 #### 等比網格 (GEOMETRIC)
 ```
-下方網格：price = current_price × (1 - grid_ratio)^i
-上方網格：price = current_price × (1 + grid_ratio)^i
+下方: price = current_price × (1 - grid_ratio)^i
+上方: price = current_price × (1 + grid_ratio)^i
 ```
-- 適合：趨勢行情、指數型波動
-- 參數：`grid_ratio` = 0.01 ~ 0.1 (1% ~ 10%)
-
-**交易方向：**
 
 | 方向 | 初始倉位 | 網格分佈 |
 |------|----------|----------|
-| LONG (做多) | 50% 資金開多倉 | 下方網格 (加倉) |
-| SHORT (做空) | 50% 資金開空倉 | 上方網格 (加倉) |
-| BOTH (雙向) | 無初始倉位 | 上下同時掛單 |
-
----
+| LONG | 50% 資金開多倉 | 下方網格 (加倉) |
+| SHORT | 50% 資金開空倉 | 上方網格 (加倉) |
+| BOTH | 無初始倉位 | 上下同時掛單 |
 
 ### 3. Orderly 客戶端 (`client.py`)
-
-**核心功能：**
 
 | 方法 | 說明 |
 |------|------|
 | `create_limit_order()` | 創建限價訂單 |
 | `create_market_order()` | 創建市價訂單 |
-| `cancel_order()` | 取消訂單 |
-| `cancel_all_orders()` | 取消所有訂單 |
-| `get_positions()` | 獲取持倉 |
-| `get_orders()` | 獲取訂單列表 |
+| `cancel_order()` / `cancel_all_orders()` | 取消訂單 |
+| `get_positions()` / `get_orders()` | 查詢持倉/訂單 |
 | `close_position()` | 平倉 |
 
-**速率限制：**
-- 預設 10 請求/秒
-- 自動指數退避重試
-- 429 錯誤自動處理
-
----
+速率控制使用 `_rate_control` 字典實現自適應速率限制（自動退避 + 恢復）。`rate_limiter` 物件用於 `execute_with_protection` 包裝。
 
 ### 4. 會話管理器 (`session_service.py`)
 
-**功能：**
-- 多會話並發管理
-- 會話唯一性驗證 (同 ticker-account 只能一個活躍會話)
+- 多會話並發管理（同 ticker-account 僅允許一個活躍會話）
 - 會話恢復與持久化
-- 批量創建/停止會話
-
-**限流保護：**
-```python
-SessionCreationLimiter:
-    max_concurrent = 5    # 最大並發創建數
-    max_per_second = 10   # 每秒最大創建數
-```
+- `SessionCreationLimiter`: max_concurrent=5, max_per_second=10
+- `get_bot(session_id)`: 取得 bot 實例（帶鎖保護與 session 存在性檢查）
 
 ---
 
@@ -392,6 +259,8 @@ SessionCreationLimiter:
 | `/api/grid/user/{user_id}/grids` | GET | 獲取用戶所有網格 |
 | `/api/grid/profit/{session_id}` | GET | 獲取利潤報告 |
 | `/api/grid/summary` | GET | 網格摘要 (支持篩選) |
+| `/api/grid/stream/{user_id}` | GET | SSE 實時推送 |
+| `/api/grid/teststop` | POST | 測試用停止（僅 `DEBUG=true`） |
 
 ### 啟動網格請求範例
 
@@ -417,8 +286,8 @@ SessionCreationLimiter:
 | 端點 | 說明 |
 |------|------|
 | `/health` | 健康檢查 |
-| `/health/ready` | 就緒檢查 (含依賴) |
-| `/metrics` | 系統指標 |
+| `/health/ready` | 就緒檢查 (含 MongoDB、WebSocket) |
+| `/metrics` | 詳細系統指標 |
 
 ---
 
@@ -513,9 +382,13 @@ ORDERLY_ACCOUNT_ID=your_account_id
 MONGODB_URI=mongodb://localhost:27017/orderly_bot
 
 # 網路設定 (可選)
-ORDERLY_TESTNET=true        # 使用測試網 (默認 true)
-UVICORN_HOST=0.0.0.0        # 伺服器 Host
-UVICORN_PORT=8001           # 伺服器 Port
+ORDERLY_TESTNET=true
+UVICORN_HOST=0.0.0.0
+UVICORN_PORT=8001
+
+# CORS（從環境變數讀取）
+FRONTEND_URL=http://localhost:5173
+CORS_ORIGINS=                    # 額外允許的 origins（逗號分隔）
 
 # WebSocket 優化 (Docker 環境建議)
 WEBSOCKET_PING_INTERVAL=30
@@ -535,10 +408,8 @@ DEBUG=false
 ### Docker 部署
 
 ```bash
-# 構建 image
 docker build -t orderly-bot:latest .
 
-# 運行容器
 docker run -d \
   --name orderly-bot \
   -p 8001:8001 \
@@ -552,6 +423,7 @@ docker run -d \
 - [ ] `DEBUG=false`
 - [ ] MongoDB 啟用 Replica Set
 - [ ] 配置 SSL/TLS
+- [ ] 設置正確的 `FRONTEND_URL` 和 `CORS_ORIGINS`
 - [ ] 設置防火牆規則
 - [ ] 配置日誌收集
 
@@ -569,20 +441,11 @@ docker run -d \
 
 ### 常見問題排查
 
-**1. WebSocket 連接失敗**
-- 檢查網路連接
-- 確認 Orderly API 憑證
-- 查看斷路器狀態
+**WebSocket 連接失敗** — 檢查網路連接、Orderly API 憑證、斷路器狀態。
 
-**2. 訂單下單失敗**
-- 檢查保證金是否充足
-- 確認市場價格在網格範圍內
-- 查看 API 速率限制狀態
+**訂單下單失敗** — 檢查保證金充足、市場價格在網格範圍內、API 速率限制。
 
-**3. 會話無法啟動**
-- 確認同 ticker 沒有活躍會話
-- 檢查資料庫連接
-- 查看啟動日誌
+**會話無法啟動** — 確認同 ticker 沒有活躍會話、檢查資料庫連接。
 
 ### Debug 模式
 
@@ -598,13 +461,8 @@ DEBUG=true
 ### 本地開發
 
 ```bash
-# 安裝依賴
 pip install -r requirements.txt
-
-# 複製配置
 cp .env.example .env
-
-# 啟動開發伺服器
 python app.py
 # 或支持熱重載
 uvicorn src.api.server:app --host 0.0.0.0 --port 8001 --reload
@@ -613,28 +471,57 @@ uvicorn src.api.server:app --host 0.0.0.0 --port 8001 --reload
 ### 運行測試
 
 ```bash
-# 運行所有測試
-pytest tests/ -v
-
-# 單元測試
-pytest tests/unit/ -v
-
-# 整合測試
-pytest tests/integration/ -v
-
-# 覆蓋率報告
-pytest tests/ --cov=src --cov-report=html
+pytest tests/ -v              # 全部測試
+pytest tests/unit/ -v         # 單元測試
+pytest tests/integration/ -v  # 整合測試
+pytest tests/ --cov=src --cov-report=html  # 覆蓋率
 ```
 
 ### 代碼規範
 
-- 使用 Python 3.12+
+- Python 3.12+
 - 所有 I/O 使用 `async/await`
 - 使用 Pydantic 進行數據驗證
-- 使用 Decimal 進行價格計算
+- 使用 `Decimal` 進行價格計算
+
+### 跨專案共享元件
+
+錢包簽名驗證邏輯位於 `shared/wallet_verifier/`，修改時兩個專案同步生效：
+- `orderly-bot/src/auth/wallet_signature.py` — thin wrapper，外部呼叫 `initialize_with_database()`
+- `orderly_refer/src/auth/wallet_verifier.py` — thin wrapper，自動初始化 DB
 
 ---
 
-## 聯繫資訊
+## 已知問題與注意事項
 
-如有問題，請聯繫原開發者或查閱 README.md。
+| 項目 | 說明 |
+|------|------|
+| SSE stream 認證 | `/api/grid/stream/{user_id}` 認證參數通過 query string 傳遞（EventSource API 不支援自訂 header），access log 可能暴露簽名。長期建議改為 token exchange 機制 |
+| 既有測試失敗（4 個） | `test_update_user` 查詢條件不一致、`test_grid_signal` 3 個觸發邏輯斷言失敗。均為修改前已存在 |
+| `mongo_manager.py` 測試 | 所有 DB async methods 需使用 `AsyncMock`，`get_user()` 有三段 fallback 查詢（`user_id` → `_id` → `wallet_address`） |
+
+---
+
+## 變更紀錄
+
+### 2026-02-11
+
+**技術債務全面清理：**
+
+1. CORS origins 改為從環境變數 `FRONTEND_URL` / `CORS_ORIGINS` 讀取（新增 `src/utils/cors_config.py`）
+2. `client.py` 中 `rate_limiter[...]` → `_rate_control[...]`，修復潛在 runtime TypeError
+3. `get_profit_report` 改用 `session_manager.get_bot(session_id)`，不再直接存取 `_sessions_lock` 和 `sessions`
+4. 錢包驗證器抽取至 `shared/wallet_verifier/` 共享 package
+
+### 2026-02-10
+
+**Code Review 與安全修復：**
+1. 重複的 `StopConfig` 重命名為 `TestStopConfig`
+2. `/api/grid/teststop` 加入 `DEBUG` 環境變數保護
+3. 識別其他技術債務（已於 2026-02-11 全部修復）
+
+### 2026-02-09
+
+**測試修復：**
+1. 刪除重複測試檔 `test_mongo_manager_backup.py`
+2. AsyncMock 對齊非同步 Mongo 操作

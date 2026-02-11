@@ -37,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.auth.wallet_signature import WalletSignatureVerifier
 from src.auth.auth_decorators import init_auth_dependencies, WalletAuthContext
 from src.utils.resilient_handler import api_retry
+from src.utils.cors_config import configure_cors
 from src.utils.slowapi_limiter import get_slowapi_rate_limiter, limiter, RATE_LIMITS
 from slowapi.errors import RateLimitExceeded
 from src.utils.slowapi_dependencies import auto_rate_limit
@@ -225,14 +226,7 @@ app = FastAPI(title="Grid Trading Server", version="1.0.0", lifespan=lifespan)
 # 錢包簽名驗證器
 wallet_verifier = WalletSignatureVerifier()
 
-#For test
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://myapp.com", "http://localhost:5174", "http://localhost:5173", "http://localhost:5175", "https://orderly-front-delta.vercel.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app)
 
 # 全域會話管理器
 session_manager = SessionManager()
@@ -791,14 +785,7 @@ async def get_profit_report(request: Request, session_id: str):
         session_id = validate_session_id(session_id)
         
         # 從會話管理器獲取機器人實例
-        async with session_manager._sessions_lock:
-            if session_id not in session_manager.sessions:
-                raise GridTradingException(
-                    error_code=ErrorCode.SESSION_NOT_FOUND,
-                    details={"session_id": session_id}
-                )
-            
-            bot = session_manager.sessions[session_id]
+        bot = await session_manager.get_bot(session_id)
         
         # 獲取利潤報告
         profit_report = await bot.get_profit_report()

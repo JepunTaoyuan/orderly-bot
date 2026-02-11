@@ -86,7 +86,7 @@ class OrderlyClient:
                     raise ValueError("Missing self argument in decorated method")
 
                 # ⭐ 新增：智能速率控制 - 檢查是否需要排隊
-                if instance.rate_limiter["adaptive_enabled"]:
+                if instance._rate_control["adaptive_enabled"]:
                     await instance._wait_for_rate_limit()
 
                 start_time = time.time()
@@ -123,7 +123,7 @@ class OrderlyClient:
                     response_time = time.time() - start_time
 
                     # ⭐ 新增：更新速率限制器 - 成功處理
-                    if instance.rate_limiter["adaptive_enabled"]:
+                    if instance._rate_control["adaptive_enabled"]:
                         instance._update_rate_limit_on_success(response_time)
 
                     # 記錄響應時間（保留最近50個）
@@ -150,7 +150,7 @@ class OrderlyClient:
                                                      max(instance.api_rate_stats["total_requests"], 1)) * 100,
                                        "response_analysis": response_analysis,
                                        "request_params": request_params,
-                                       "rate_interval": instance.rate_limiter["current_interval"]
+                                       "rate_interval": instance._rate_control["current_interval"]
                                    })
                     else:
                         # ⭐ 新增：處理API返回的業務錯誤
@@ -168,7 +168,7 @@ class OrderlyClient:
                     error_analysis = instance._analyze_api_error(e, endpoint_name, response_time, request_params)
 
                     # ⭐ 新增：更新速率限制器 - 錯誤處理
-                    if instance.rate_limiter["adaptive_enabled"]:
+                    if instance._rate_control["adaptive_enabled"]:
                         instance._update_rate_limit_on_error(error_analysis["is_rate_limit"])
 
                     # 統計API錯誤
@@ -200,7 +200,7 @@ class OrderlyClient:
                                    "failed_requests": instance.api_rate_stats["failed_requests"],
                                    "error_analysis": error_analysis,
                                    "request_params": request_params,
-                                   "rate_interval": instance.rate_limiter["current_interval"]
+                                   "rate_interval": instance._rate_control["current_interval"]
                                })
 
                     raise
