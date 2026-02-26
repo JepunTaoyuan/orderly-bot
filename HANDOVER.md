@@ -293,16 +293,45 @@ orderly-bot/
 
 ## 資料庫結構
 
-### Collections
+**Database**: `grid_bot`（預設），由 `MONGODB_URI` 決定
+
+### Collections 總覽
+
+| Collection | 說明 | `_id` 格式 |
+|------------|------|-------------|
+| `users` | 用戶 API 憑證表 | auto (ObjectId) |
+| `sessions` | 網格交易會話表 | auto (ObjectId) |
+| `used_nonces` | 已使用 Nonce 表 | auto (ObjectId) |
+| `grid_summaries` | 網格摘要表 | auto (ObjectId) |
+| `user_api_keys` | 用戶 API 密鑰表 | user_id |
+
+### Collections 詳細結構
+
+#### `users`
+```javascript
+{
+  _id: ObjectId("..."),
+  user_id: "user123",          // 用戶 ID（唯一索引）
+  api_key: "ed25519:...",      // Orderly API Key（唯一索引）
+  api_secret: "base64:...",    // Orderly API Secret
+  wallet_address: "0x...",     // 錢包地址（唯一索引）
+  created_at: 1705320000.0,    // Unix timestamp
+  updated_at: 1705320000.0     // Unix timestamp
+}
+```
+**索引**: `user_id`（唯一）、`api_key`（唯一）、`wallet_address`（唯一）
+**查詢方式**: `get_user()` 依序嘗試 `user_id` → `_id` → `wallet_address` 三種方式查找
+**使用位置**: `utils/mongo_manager.py`
 
 #### `sessions`
 ```javascript
 {
-  _id: "user123_PERP_BTC_USDC",
+  _id: ObjectId("..."),
+  session_id: "user123_PERP_BTC_USDC",  // 會話唯一 ID（唯一索引）
   user_id: "user123",
   ticker: "PERP_BTC_USDC",
-  status: "ACTIVE",  // ACTIVE, STOPPED, ERROR
-  config: {
+  status: "active",            // 會話狀態（active, stopped, error）
+  config: {                    // 策略設定（由 session_data 動態傳入）
     direction: "BOTH",
     grid_type: "ARITHMETIC",
     upper_bound: 45000,
@@ -310,10 +339,25 @@ orderly-bot/
     grid_levels: 6,
     total_margin: 1000
   },
-  created_at: ISODate("2024-01-01T12:00:00Z"),
-  updated_at: ISODate("2024-01-01T12:30:00Z")
+  created_at: 1705320000.0,
+  updated_at: 1705320000.0
 }
 ```
+**索引**: `session_id`（唯一）、`(user_id, ticker, status)` 組合索引（唯一，僅 `status=active` 時生效，partial filter expression）
+**使用位置**: `utils/mongo_manager.py`, `services/session_service.py`
+
+#### `used_nonces`（已使用 Nonce 表）
+```javascript
+{
+  _id: ObjectId("..."),
+  nonce: "random_string",     // Nonce 值
+  expires_at: 1705323600.0,   // 過期時間（Unix timestamp）
+  created_at: 1705320000.0    // 建立時間（Unix timestamp）
+}
+```
+**用途**: 防止重放攻擊，錢包簽名驗證時記錄已使用的 nonce，確保每個 nonce 只被使用一次。
+**背景清理**: 定期刪除 `expires_at <= current_time` 的過期記錄。
+**使用位置**: `utils/mongo_manager.py`
 
 #### `grid_summaries`
 ```javascript
@@ -329,16 +373,18 @@ orderly-bot/
   created_at: ISODate("2024-01-01T12:00:00Z")
 }
 ```
+**使用位置**: `services/grid_summary_service.py`
 
 #### `user_api_keys`
 ```javascript
 {
-  _id: "user123",
+  _id: "user123",              // 用戶 ID
   user_api_key: "encrypted_key",
   user_api_secret: "encrypted_secret",
   created_at: ISODate("2024-01-01T12:00:00Z")
 }
 ```
+**使用位置**: `services/database_service.py`
 
 ---
 
